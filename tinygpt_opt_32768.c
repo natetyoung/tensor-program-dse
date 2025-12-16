@@ -3,121 +3,71 @@
 #include <time.h>
 
 void einsum_0(float * restrict L0_X, float * restrict L0_WQ, float * restrict L0_Q) {
-    for (int t_m=0; t_m<32; t_m++) {
-        for (int t_d=0; t_d<128; t_d++) {
-            // LD/ST L0_X[(t_m)*128 + (t_d)*1]
-            L0_X[(t_m)*128 + (t_d)*1] = L0_X[(t_m)*128 + (t_d)*1];
-            for (int s_d_L0_WQ=0; s_d_L0_WQ<128; s_d_L0_WQ++) {
-                for (int s_k_L0_WQ=0; s_k_L0_WQ<128; s_k_L0_WQ++) {
-                    // LD/ST L0_WQ[(t_d + s_d_L0_WQ)*128 + (s_k_L0_WQ)*1]
-                    L0_WQ[(t_d + s_d_L0_WQ)*128 + (s_k_L0_WQ)*1] = L0_WQ[(t_d + s_d_L0_WQ)*128 + (s_k_L0_WQ)*1];
-                }
+    for (int m=0; m<32; m++) {
+        for (int k=0; k<128; k++) {
+            float acc = 0.0f;
+            for (int d=0; d<128; d++) {
+                acc += L0_X[m*128 + d*1] * L0_WQ[d*128 + k*1];
             }
-            for (int s_m_L0_Q=0; s_m_L0_Q<32; s_m_L0_Q++) {
-                for (int s_k_L0_Q=0; s_k_L0_Q<128; s_k_L0_Q++) {
-                    // LD/ST L0_Q[(t_m + s_m_L0_Q)*128 + (s_k_L0_Q)*1]
-                    L0_Q[(t_m + s_m_L0_Q)*128 + (s_k_L0_Q)*1] = L0_Q[(t_m + s_m_L0_Q)*128 + (s_k_L0_Q)*1];
-                }
-            }
+            L0_Q[m*128 + k*1] = acc;
         }
     }
 }
-
 void einsum_1(float * restrict L0_Q, float * restrict L0_K, float * restrict L0_S) {
-    for (int s_m_L0_Q=0; s_m_L0_Q<32; s_m_L0_Q++) {
-        for (int s_k_L0_Q=0; s_k_L0_Q<128; s_k_L0_Q++) {
-            // LD/ST L0_Q[(s_m_L0_Q)*128 + (s_k_L0_Q)*1]
-            L0_Q[(s_m_L0_Q)*128 + (s_k_L0_Q)*1] = L0_Q[(s_m_L0_Q)*128 + (s_k_L0_Q)*1];
-        }
-    }
-    for (int s_n_L0_K=0; s_n_L0_K<32; s_n_L0_K++) {
-        for (int s_k_L0_K=0; s_k_L0_K<128; s_k_L0_K++) {
-            // LD/ST L0_K[(s_n_L0_K)*128 + (s_k_L0_K)*1]
-            L0_K[(s_n_L0_K)*128 + (s_k_L0_K)*1] = L0_K[(s_n_L0_K)*128 + (s_k_L0_K)*1];
-        }
-    }
-    for (int s_m_L0_S=0; s_m_L0_S<32; s_m_L0_S++) {
-        for (int s_n_L0_S=0; s_n_L0_S<32; s_n_L0_S++) {
-            // LD/ST L0_S[(s_m_L0_S)*32 + (s_n_L0_S)*1]
-            L0_S[(s_m_L0_S)*32 + (s_n_L0_S)*1] = L0_S[(s_m_L0_S)*32 + (s_n_L0_S)*1];
-        }
-    }
-}
-
-void einsum_2(float * restrict L0_S, float * restrict L0_V, float * restrict L0_O) {
-    for (int s_m_L0_S=0; s_m_L0_S<32; s_m_L0_S++) {
-        for (int s_n_L0_S=0; s_n_L0_S<32; s_n_L0_S++) {
-            // LD/ST L0_S[(s_m_L0_S)*32 + (s_n_L0_S)*1]
-            L0_S[(s_m_L0_S)*32 + (s_n_L0_S)*1] = L0_S[(s_m_L0_S)*32 + (s_n_L0_S)*1];
-        }
-    }
-    for (int s_n_L0_V=0; s_n_L0_V<32; s_n_L0_V++) {
-        for (int s_k_L0_V=0; s_k_L0_V<128; s_k_L0_V++) {
-            // LD/ST L0_V[(s_n_L0_V)*128 + (s_k_L0_V)*1]
-            L0_V[(s_n_L0_V)*128 + (s_k_L0_V)*1] = L0_V[(s_n_L0_V)*128 + (s_k_L0_V)*1];
-        }
-    }
-    for (int s_m_L0_O=0; s_m_L0_O<32; s_m_L0_O++) {
-        for (int s_k_L0_O=0; s_k_L0_O<128; s_k_L0_O++) {
-            // LD/ST L0_O[(s_m_L0_O)*128 + (s_k_L0_O)*1]
-            L0_O[(s_m_L0_O)*128 + (s_k_L0_O)*1] = L0_O[(s_m_L0_O)*128 + (s_k_L0_O)*1];
-        }
-    }
-}
-
-void einsum_3(float * restrict L0_O, float * restrict L0_Wo, float * restrict L0_Y) {
-    for (int s_m_L0_O=0; s_m_L0_O<32; s_m_L0_O++) {
-        for (int s_k_L0_O=0; s_k_L0_O<128; s_k_L0_O++) {
-            // LD/ST L0_O[(s_m_L0_O)*128 + (s_k_L0_O)*1]
-            L0_O[(s_m_L0_O)*128 + (s_k_L0_O)*1] = L0_O[(s_m_L0_O)*128 + (s_k_L0_O)*1];
-        }
-    }
-    for (int s_k_L0_Wo=0; s_k_L0_Wo<128; s_k_L0_Wo++) {
-        for (int s_d_L0_Wo=0; s_d_L0_Wo<128; s_d_L0_Wo++) {
-            // LD/ST L0_Wo[(s_k_L0_Wo)*128 + (s_d_L0_Wo)*1]
-            L0_Wo[(s_k_L0_Wo)*128 + (s_d_L0_Wo)*1] = L0_Wo[(s_k_L0_Wo)*128 + (s_d_L0_Wo)*1];
-        }
-    }
-    for (int s_m_L0_Y=0; s_m_L0_Y<32; s_m_L0_Y++) {
-        for (int s_d_L0_Y=0; s_d_L0_Y<128; s_d_L0_Y++) {
-            // LD/ST L0_Y[(s_m_L0_Y)*128 + (s_d_L0_Y)*1]
-            L0_Y[(s_m_L0_Y)*128 + (s_d_L0_Y)*1] = L0_Y[(s_m_L0_Y)*128 + (s_d_L0_Y)*1];
-        }
-    }
-}
-
-void einsum_4(float * restrict L0_Y, float * restrict L0_W1, float * restrict L0_H) {
-    for (int s_m_L0_Y=0; s_m_L0_Y<32; s_m_L0_Y++) {
-        for (int s_d_L0_Y=0; s_d_L0_Y<128; s_d_L0_Y++) {
-            // LD/ST L0_Y[(s_m_L0_Y)*128 + (s_d_L0_Y)*1]
-            L0_Y[(s_m_L0_Y)*128 + (s_d_L0_Y)*1] = L0_Y[(s_m_L0_Y)*128 + (s_d_L0_Y)*1];
-        }
-    }
-    for (int s_d_L0_W1=0; s_d_L0_W1<128; s_d_L0_W1++) {
-        // LD/ST L0_W1[(s_d_L0_W1)*512]
-        L0_W1[(s_d_L0_W1)*512] = L0_W1[(s_d_L0_W1)*512];
-    }
-    // LD/ST L0_H[0]
-    L0_H[0] = L0_H[0];
-}
-
-void einsum_5(float * restrict L0_H, float * restrict L0_W2, float * restrict L0_Z) {
-    for (int t_m=0; t_m<32; t_m++) {
-        // LD/ST L0_H[(t_m)*512]
-        L0_H[(t_m)*512] = L0_H[(t_m)*512];
-        for (int s_d_L0_W2=0; s_d_L0_W2<128; s_d_L0_W2++) {
-            // LD/ST L0_W2[(s_d_L0_W2)*1]
-            L0_W2[(s_d_L0_W2)*1] = L0_W2[(s_d_L0_W2)*1];
-        }
-        for (int s_m_L0_Z=0; s_m_L0_Z<32; s_m_L0_Z++) {
-            for (int s_d_L0_Z=0; s_d_L0_Z<128; s_d_L0_Z++) {
-                // LD/ST L0_Z[(t_m + s_m_L0_Z)*128 + (s_d_L0_Z)*1]
-                L0_Z[(t_m + s_m_L0_Z)*128 + (s_d_L0_Z)*1] = L0_Z[(t_m + s_m_L0_Z)*128 + (s_d_L0_Z)*1];
+    for (int m=0; m<32; m++) {
+        for (int n=0; n<32; n++) {
+            float acc = 0.0f;
+            for (int k=0; k<128; k++) {
+                acc += L0_Q[m*128 + k*1] * L0_K[n*128 + k*1];
             }
+            L0_S[m*32 + n*1] = acc;
         }
     }
 }
-
+void einsum_2(float * restrict L0_S, float * restrict L0_V, float * restrict L0_O) {
+    for (int m=0; m<32; m++) {
+        for (int k=0; k<128; k++) {
+            float acc = 0.0f;
+            for (int n=0; n<32; n++) {
+                acc += L0_S[m*32 + n*1] * L0_V[n*128 + k*1];
+            }
+            L0_O[m*128 + k*1] = acc;
+        }
+    }
+}
+void einsum_3(float * restrict L0_O, float * restrict L0_Wo, float * restrict L0_Y) {
+    for (int m=0; m<32; m++) {
+        for (int d=0; d<128; d++) {
+            float acc = 0.0f;
+            for (int k=0; k<128; k++) {
+                acc += L0_O[m*128 + k*1] * L0_Wo[k*128 + d*1];
+            }
+            L0_Y[m*128 + d*1] = acc;
+        }
+    }
+}
+void einsum_4(float * restrict L0_Y, float * restrict L0_W1, float * restrict L0_H) {
+    for (int m=0; m<32; m++) {
+        for (int f=0; f<512; f++) {
+            float acc = 0.0f;
+            for (int d=0; d<128; d++) {
+                acc += L0_Y[m*128 + d*1] * L0_W1[d*512 + f*1];
+            }
+            L0_H[m*512 + f*1] = acc;
+        }
+    }
+}
+void einsum_5(float * restrict L0_H, float * restrict L0_W2, float * restrict L0_Z) {
+    for (int m=0; m<32; m++) {
+        for (int d=0; d<128; d++) {
+            float acc = 0.0f;
+            for (int f=0; f<512; f++) {
+                acc += L0_H[m*512 + f*1] * L0_W2[f*128 + d*1];
+            }
+            L0_Z[m*128 + d*1] = acc;
+        }
+    }
+}
 int main() {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);

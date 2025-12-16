@@ -21,75 +21,133 @@ class Einsum:
         self.output_operand:str = output_operand
         self.dim_sizes:Dict[str,int] = dim_sizes
 
-def emit_c_code_section(einsum, einsum_idx, all_dim_sizes, temporal_dim, spatial_dim, solver, same_node, parent, op_allowed_temp_dims):
-    """Emit C code for a single einsum as a function."""
-    ops = list(einsum.operand_dims.keys())
-    output_op = einsum.output_operand
-    input_ops = [op for op in ops if op != output_op]
-    all_params = input_ops + [output_op]
+def compute_strides(dims, all_dim_sizes):
+    strides = {}
+    stride = 1
+    for d in reversed(dims):
+        strides[d] = stride
+        stride *= all_dim_sizes[d]
+    return strides
 
-    code = f'void einsum_{einsum_idx}('
-    code += ', '.join([f'float * restrict {op}' for op in all_params])
-    code += ') {\n'
+def emit_c_code_section(
+    einsum,
+    einsum_idx,
+    all_dim_sizes,
+    temporal_dim,
+    solver,
+    op_allowed_temp_dims,
+):
+    """
+    Emit a mathematically correct einsum kernel with wrap/temporal factors.
+    """
+    ops = list(einsum.operand_dims.keys())
+    out = einsum.output_operand
+    inputs = [o for o in ops if o != out]
+
+    # Dimensions
+    out_dims = einsum.operand_dims[out]
+    in_dims = {o: einsum.operand_dims[o] for o in inputs}
+
+    # Contracted dims = appear in inputs but not output
+    contracted = sorted(
+        set(d for o in inputs for d in in_dims[o]) - set(out_dims)
+    )
+
+    # Strides
+    def compute_strides(dims, sizes):
+        strides = {}
+        stride = 1
+        for d in reversed(dims):
+            strides[d] = stride
+            stride *= sizes[d]
+        return strides
+
+    out_strides = compute_strides(out_dims, all_dim_sizes)
+    in_strides = {o: compute_strides(in_dims[o], all_dim_sizes) for o in inputs}
+
+    code = []
+    code.append(
+        f"void einsum_{einsum_idx}("
+        + ", ".join([f"float * restrict {o}" for o in inputs + [out]])
+        + ") {"
+    )
 
     indent = 1
-    loop_vars = []
 
-    # Emit temporal loops based on solver
-    for dim in op_allowed_temp_dims[ops[0]]:
-        factor = solver.Value(temporal_dim[ops[0]][dim])
+    # ---- temporal wrap loops ----
+    for dim in op_allowed_temp_dims[out]:
+        factor = solver.Value(temporal_dim[out][dim])
         if factor > 1:
-            var = f't_{dim}'
-            loop_vars.append((var, dim))
-            code += '    ' * indent + f'for (int {var}=0; {var}<{factor}; {var}++) {{\n'
+            code.append(
+                "    " * indent
+                + f"for (int {dim}_wrap=0; {dim}_wrap<{factor}; {dim}_wrap++) {{"
+            )
+            code.append(
+                "    " * (indent + 1)
+                + f"int {dim}_start = {dim}_wrap * ({all_dim_sizes[dim]} / {factor});"
+            )
+            code.append(
+                "    " * (indent + 1)
+                + f"int {dim}_end = ({dim}_wrap == {factor}-1 ? {all_dim_sizes[dim]} : {dim}_start + ({all_dim_sizes[dim]} / {factor}));"
+            )
             indent += 1
 
-    # Emit spatial loops and access statements
-    for op in ops:
-        spatial_loops = []
-        for dim in einsum.operand_dims[op]:
-            factor = solver.Value(spatial_dim[op][dim])
-            if factor > 1:
-                var = f's_{dim}_{op}'
-                spatial_loops.append((var, dim))
-                code += '    ' * indent + f'for (int {var}=0; {var}<{factor}; {var}++) {{\n'
-                indent += 1
+    # ---- output loops ----
+    for d in out_dims:
+        if solver.Value(temporal_dim[out][d]) > 1:
+            code.append(
+                "    " * indent + f"for (int {d}={d}_start; {d}<{d}_end; {d}++) {{"
+            )
+        else:
+            code.append(
+                "    " * indent + f"for (int {d}=0; {d}<{all_dim_sizes[d]}; {d}++) {{"
+            )
+        indent += 1
 
-        # Compute index for each operand
-        index_expr = []
-        for dim in einsum.operand_dims[op]:
-            parts = []
-            for lv, ldim in loop_vars:
-                if ldim == dim:
-                    parts.append(lv)
-            for lv, ldim in spatial_loops:
-                if ldim == dim:
-                    parts.append(lv)
-            stride = 1
-            dims = einsum.operand_dims[op]
-            for d in reversed(dims):
-                if d == dim:
-                    break
-                stride *= all_dim_sizes[d]
-            if parts:
-                index_expr.append(f"({' + '.join(parts)})*{stride}")
-        index_expr = ' + '.join(index_expr) if index_expr else '0'
+    # accumulator
+    code.append("    " * indent + "float acc = 0.0f;")
 
-        code += '    ' * indent + f'// LD/ST {op}[{index_expr}]\n'
-        code += '    ' * indent + f'{op}[{index_expr}] = {op}[{index_expr}];\n'
+    # ---- reduction loops ----
+    for d in contracted:
+        code.append(
+            "    " * indent + f"for (int {d}=0; {d}<{all_dim_sizes[d]}; {d}++) {{"
+        )
+        indent += 1
 
-        # Close spatial loops
-        for _ in spatial_loops:
-            indent -= 1
-            code += '    ' * indent + '}\n'
+    # ---- load * load ----
+    def index_expr(op, dims, strides):
+        return " + ".join([f"{d}*{strides[d]}" for d in dims])
 
-    # Close temporal loops
-    for _ in loop_vars:
+    mul_terms = []
+    for o in inputs:
+        mul_terms.append(f"{o}[{index_expr(o, in_dims[o], in_strides[o])}]")
+
+    code.append("    " * indent + f"acc += {' * '.join(mul_terms)};")
+
+    # close reduction loops
+    for _ in contracted:
         indent -= 1
-        code += '    ' * indent + '}\n'
+        code.append("    " * indent + "}")
 
-    code += '}\n\n'
-    return code
+    # ---- store ----
+    code.append(
+        "    " * indent + f"{out}[{index_expr(out, out_dims, out_strides)}] = acc;"
+    )
+
+    # close output loops
+    for _ in out_dims:
+        indent -= 1
+        code.append("    " * indent + "}")
+
+    # close temporal wrap loops
+    for dim in op_allowed_temp_dims[out]:
+        factor = solver.Value(temporal_dim[out][dim])
+        if factor > 1:
+            indent -= 1
+            code.append("    " * indent + "}")
+
+    code.append("}\n")
+    return "\n".join(code)
 
 
 def emit_c_program_chains(chains, solver, all_operands, all_operand_dims, all_dim_sizes,
@@ -105,11 +163,8 @@ def emit_c_program_chains(chains, solver, all_operands, all_operand_dims, all_di
                 einsum_idx=e_idx,
                 all_dim_sizes=all_dim_sizes,
                 temporal_dim=temporal_dim,
-                spatial_dim=spatial_dim,
                 solver=solver,
-                same_node=same_node,
-                parent=parent,
-                op_allowed_temp_dims=op_allowed_temp_dims
+                op_allowed_temp_dims=op_allowed_temp_dims,
             )
 
     # Emit main
