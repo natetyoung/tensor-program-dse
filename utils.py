@@ -16,7 +16,8 @@ def emit_array_decl(name, dims, dim_sizes):
     size = 1
     for d in dims:
         size *= dim_sizes[d]
-    return f"float *{name} = (float*)malloc(sizeof(float) * {size});"
+    # restrict is critical for Polly
+    return f"float * restrict {name} = (float*)malloc(sizeof(float) * {size});"
 
 def emit_init(name, dims, dim_sizes):
     size = 1
@@ -27,14 +28,11 @@ def emit_init(name, dims, dim_sizes):
         {name}[i] = 1.0f;
     """
 
-def emit_naive_kernel(e: Einsum):
+def emit_fused_kernel(e: Einsum):
     out = e.output_operand
     dims = e.dim_sizes
-
     out_dims = e.operand_dims[out]
     in_ops = [k for k in e.operand_dims if k != out]
-
-    # deterministic order
     red_dims = [d for d in dims if d not in out_dims]
 
     code = ""
@@ -43,30 +41,43 @@ def emit_naive_kernel(e: Einsum):
     for d in out_dims:
         code += f"for (int {d} = 0; {d} < {dims[d]}; {d}++) {{\n"
 
-    # Zero output
-    out_idx = c_index(out, out_dims, dims)
-    code += f"{out}[{out_idx}] = 0.0f;\n"
+    # Scalar accumulator
+    code += "float acc = 0.0f;\n"
 
     # Reduction loops
     for r in red_dims:
         code += f"for (int {r} = 0; {r} < {dims[r]}; {r}++) {{\n"
 
-    # Multiply-accumulate
     muls = []
     for op in in_ops:
         idx = c_index(op, e.operand_dims[op], dims)
         muls.append(f"{op}[{idx}]")
 
-    code += f"{out}[{out_idx}] += " + " * ".join(muls) + ";\n"
+    code += "acc += " + " * ".join(muls) + ";\n"
 
     # Close reduction loops
     for _ in red_dims:
         code += "}\n"
 
+    out_idx = c_index(out, out_dims, dims)
+    code += f"{out}[{out_idx}] = acc;\n"
+
     # Close output loops
     for _ in out_dims:
         code += "}\n"
 
+    return code
+
+
+def emit_einsum_function(e: Einsum, idx: int) -> str:
+    args = []
+    for name in e.operand_dims:
+        args.append(f"float * restrict {name}")
+    arglist = ", ".join(args)
+
+    code = f"void einsum_{idx}({arglist}) {{\n"
+    code += emit_fused_kernel(e)
+    code += "}\n\n"
     return code
 
 def collect_global_dim_sizes(einsums):
@@ -85,6 +96,13 @@ def emit_c_program(einsums, optimized=False) -> str:
 #include <stdlib.h>
 #include <time.h>
 """
+
+    code = headers
+
+    # Emit einsum functions (Polly sees these!)
+    for i, e in enumerate(einsums):
+        code += emit_einsum_function(e, i)
+
     main = "int main() {\n"
 
     # Collect arrays
@@ -104,10 +122,11 @@ def emit_c_program(einsums, optimized=False) -> str:
     clock_gettime(CLOCK_MONOTONIC, &start);
     """
 
-    # Kernels
+    # Call einsum kernels
     if not optimized:
-        for e in einsums:
-            main += emit_naive_kernel(e)
+        for i, e in enumerate(einsums):
+            args = ", ".join(e.operand_dims.keys())
+            main += f"einsum_{i}({args});\n"
     else:
         main += cb_full_tree(einsums, capacity=512*1024, emit_c_code=True)
 
@@ -120,4 +139,4 @@ def emit_c_program(einsums, optimized=False) -> str:
 }
 """
 
-    return headers + main
+    return code + main
