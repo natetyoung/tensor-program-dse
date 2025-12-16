@@ -20,23 +20,22 @@ def gpt_layer_einsums(
 
     einsums: List[Einsum] = []
 
-    # ---------- QKV projections ----------
-    for proj in ["Q", "K", "V"]:
-        einsums.append(
-            Einsum(
-                operand_dims={
-                    f"{prefix}_X": ("m", "d"),
-                    f"{prefix}_W{proj}": ("d", "k"),
-                    f"{prefix}_{proj}": ("m", "k"),
-                },
-                output_operand=f"{prefix}_{proj}",
-                dim_sizes={
-                    "m": m,
-                    "d": D,
-                    "k": D,
-                },
-            )
+    # ---------- Q projection ----------
+    einsums.append(
+        Einsum(
+            operand_dims={
+                f"{prefix}_X": ("m", "d"),
+                f"{prefix}_WQ": ("d", "k"),
+                f"{prefix}_Q": ("m", "k"),
+            },
+            output_operand=f"{prefix}_Q",
+            dim_sizes={
+                "m": m,
+                "d": D,
+                "k": D,
+            },
         )
+    )
 
     # ---------- Attention scores: Q x K^T ----------
     einsums.append(
@@ -126,16 +125,83 @@ def gpt_layer_einsums(
     return einsums
 
 if __name__ == "__main__":
-    layer = gpt_layer_einsums(
+    tiny_layer = gpt_layer_einsums(
+        batch=1,
+        seq_len=32,
+        model_dim=128,
+        prefix="L0"
+    )
+    small_layer = gpt_layer_einsums(
+        batch=1,
+        seq_len=64,
+        model_dim=256,
+        prefix="L0"
+    )
+    med_layer = gpt_layer_einsums(
+        batch=1,
+        seq_len=128,
+        model_dim=512,
+        prefix="L0"
+    )
+    large_layer = gpt_layer_einsums(
+        batch=1,
+        seq_len=256,
+        model_dim=1024,
+        prefix="L0"
+    )
+    huge_layer = gpt_layer_einsums(
         batch=1,
         seq_len=2048,
         model_dim=4096,
         prefix="L0"
     )
 
-    for e in layer:
+    for e in tiny_layer:
         print(e.operand_dims, "->", e.output_operand)
 
-    c_code = emit_c_program(layer)
-    with open("gpt_naive.c", "w") as f:
+    c_code = emit_c_program(tiny_layer)
+    with open("../../tinygpt.c", "w") as f:
         f.write(c_code)
+    caps = [8*1024, 16*1024, 32*1024]
+    for cap in caps:
+        c_code = emit_c_program(tiny_layer, optimized=True, capacity=cap)
+        with open(f"../../tinygpt_opt_{cap}.c", "w") as f:
+            f.write(c_code)
+    
+    c_code = emit_c_program(small_layer)
+    with open("../../smallgpt.c", "w") as f:
+        f.write(c_code)
+
+    caps = [32*1024, 64*1024, 128*1024]
+    for cap in caps:
+        c_code = emit_c_program(small_layer, optimized=True, capacity=cap)
+        with open(f"../../smallgpt_opt_{cap}.c", "w") as f:
+            f.write(c_code)
+
+    c_code = emit_c_program(med_layer)
+    with open("../../medgpt.c", "w") as f:
+        f.write(c_code)
+
+    caps = [64*1024, 128*1024, 256*1024]
+    for cap in caps:
+        c_code = emit_c_program(med_layer, optimized=True, capacity=cap)
+        with open(f"../../medgpt_opt_{cap}.c", "w") as f:
+            f.write(c_code)
+
+    c_code = emit_c_program(large_layer)
+    with open("../../largegpt.c", "w") as f:
+        f.write(c_code)
+
+    caps = [256*1024, 512*1024, 1024*1024]
+    for cap in caps:
+        c_code = emit_c_program(large_layer, optimized=True, capacity=cap)
+        with open(f"../../largegpt_opt_{cap}.c", "w") as f:
+            f.write(c_code)
+    
+    #c_code = emit_c_program(huge_layer)
+    #with open("../../hugegpt.c", "w") as f:
+    #    f.write(c_code)
+#
+    #c_code = emit_c_program(huge_layer, optimized=True)
+    #with open("../../hugegpt_opt.c", "w") as f:
+    #    f.write(c_code)

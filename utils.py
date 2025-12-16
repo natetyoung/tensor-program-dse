@@ -90,53 +90,54 @@ def collect_global_dim_sizes(einsums):
                 dims[d] = size
     return dims
 
-def emit_c_program(einsums, optimized=False) -> str:
+def emit_c_program(einsums, optimized=False, capacity=None) -> str:
     headers = """
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 """
-
-    code = headers
-
-    # Emit einsum functions (Polly sees these!)
-    for i, e in enumerate(einsums):
-        code += emit_einsum_function(e, i)
-
-    main = "int main() {\n"
-
-    # Collect arrays
-    arrays = {}
-    for e in einsums:
-        for name, dims in e.operand_dims.items():
-            arrays[name] = dims
-
-    # Declarations
-    global_dims = collect_global_dim_sizes(einsums)
-    for name, dims in arrays.items():
-        main += emit_array_decl(name, dims, global_dims) + "\n"
-        main += emit_init(name, dims, global_dims) + "\n"
-
-    main += """
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    """
-
-    # Call einsum kernels
+    
     if not optimized:
+        code = headers + "\n"
+
+        # Emit einsum functions (Polly sees these!)
+        for i, e in enumerate(einsums):
+            code += emit_einsum_function(e, i)
+
+        # Collect arrays
+        arrays = {}
+        for e in einsums:
+            for name, dims in e.operand_dims.items():
+                arrays[name] = dims
+        
+        main = "int main() {\n"
+
+        main += """
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        """
+
+        # Declarations
+        global_dims = collect_global_dim_sizes(einsums)
+        for name, dims in arrays.items():
+            main += emit_array_decl(name, dims, global_dims) + "\n"
+            main += emit_init(name, dims, global_dims) + "\n"
+
+        # Call einsum kernels
         for i, e in enumerate(einsums):
             args = ", ".join(e.operand_dims.keys())
             main += f"einsum_{i}({args});\n"
-    else:
-        main += cb_full_tree(einsums, capacity=512*1024, emit_c_code=True)
-
-    main += """
+        
+        main += """
     clock_gettime(CLOCK_MONOTONIC, &end);
     double t = (end.tv_sec - start.tv_sec) +
                (end.tv_nsec - start.tv_nsec) * 1e-9;
     printf("Time: %f\\n", t);
     return 0;
 }
-"""
+"""   
+    else:
+        code = cb_full_tree(einsums, capacity=capacity, emit_c_code=True)
+        main = ""
 
     return code + main

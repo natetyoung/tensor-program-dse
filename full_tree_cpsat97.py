@@ -21,10 +21,129 @@ class Einsum:
         self.output_operand:str = output_operand
         self.dim_sizes:Dict[str,int] = dim_sizes
 
+def emit_c_code_section(einsum, einsum_idx, all_dim_sizes, temporal_dim, spatial_dim, solver, same_node, parent, op_allowed_temp_dims):
+    """Emit C code for a single einsum as a function."""
+    ops = list(einsum.operand_dims.keys())
+    output_op = einsum.output_operand
+    input_ops = [op for op in ops if op != output_op]
+    all_params = input_ops + [output_op]
+
+    code = f'void einsum_{einsum_idx}('
+    code += ', '.join([f'float * restrict {op}' for op in all_params])
+    code += ') {\n'
+
+    indent = 1
+    loop_vars = []
+
+    # Emit temporal loops based on solver
+    for dim in op_allowed_temp_dims[ops[0]]:
+        factor = solver.Value(temporal_dim[ops[0]][dim])
+        if factor > 1:
+            var = f't_{dim}'
+            loop_vars.append((var, dim))
+            code += '    ' * indent + f'for (int {var}=0; {var}<{factor}; {var}++) {{\n'
+            indent += 1
+
+    # Emit spatial loops and access statements
+    for op in ops:
+        spatial_loops = []
+        for dim in einsum.operand_dims[op]:
+            factor = solver.Value(spatial_dim[op][dim])
+            if factor > 1:
+                var = f's_{dim}_{op}'
+                spatial_loops.append((var, dim))
+                code += '    ' * indent + f'for (int {var}=0; {var}<{factor}; {var}++) {{\n'
+                indent += 1
+
+        # Compute index for each operand
+        index_expr = []
+        for dim in einsum.operand_dims[op]:
+            parts = []
+            for lv, ldim in loop_vars:
+                if ldim == dim:
+                    parts.append(lv)
+            for lv, ldim in spatial_loops:
+                if ldim == dim:
+                    parts.append(lv)
+            stride = 1
+            dims = einsum.operand_dims[op]
+            for d in reversed(dims):
+                if d == dim:
+                    break
+                stride *= all_dim_sizes[d]
+            if parts:
+                index_expr.append(f"({' + '.join(parts)})*{stride}")
+        index_expr = ' + '.join(index_expr) if index_expr else '0'
+
+        code += '    ' * indent + f'// LD/ST {op}[{index_expr}]\n'
+        code += '    ' * indent + f'{op}[{index_expr}] = {op}[{index_expr}];\n'
+
+        # Close spatial loops
+        for _ in spatial_loops:
+            indent -= 1
+            code += '    ' * indent + '}\n'
+
+    # Close temporal loops
+    for _ in loop_vars:
+        indent -= 1
+        code += '    ' * indent + '}\n'
+
+    code += '}\n\n'
+    return code
+
+
+def emit_c_program_chains(chains, solver, all_operands, all_operand_dims, all_dim_sizes,
+                          temporal_dim, spatial_dim, same_node, parent, op_allowed_temp_dims):
+    """Emit C program with separate functions for each einsum."""
+    code = '#include <stdio.h>\n#include <stdlib.h>\n#include <time.h>\n\n'
+
+    # Emit functions
+    for chain_idx, chain in enumerate(chains):
+        for e_idx, einsum in enumerate(chain):
+            code += emit_c_code_section(
+                einsum,
+                einsum_idx=e_idx,
+                all_dim_sizes=all_dim_sizes,
+                temporal_dim=temporal_dim,
+                spatial_dim=spatial_dim,
+                solver=solver,
+                same_node=same_node,
+                parent=parent,
+                op_allowed_temp_dims=op_allowed_temp_dims
+            )
+
+    # Emit main
+    code += 'int main() {\n'
+    code += '    struct timespec start, end;\n'
+    code += '    clock_gettime(CLOCK_MONOTONIC, &start);\n\n'
+
+    # Allocate arrays
+    for op in sorted(all_operands):
+        dims = all_operand_dims[op]
+        total_size = 1
+        for d in dims:
+            total_size *= all_dim_sizes[d]
+        code += f'    float * restrict {op} = (float*)malloc(sizeof(float) * {total_size});\n'
+        code += f'    for (int i=0;i<{total_size};i++) {op}[i] = 1.0f;\n\n'
+
+    # Call functions
+    for chain in chains:
+        for e_idx, einsum in enumerate(chain):
+            params = [op for op in einsum.operand_dims.keys()]
+            code += f'    einsum_{e_idx}({", ".join(params)});\n'
+
+    code += '\n    clock_gettime(CLOCK_MONOTONIC, &end);\n'
+    code += '    double t = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9;\n'
+    code += '    printf("Time: %f\\n", t);\n'
+    code += '    return 0;\n'
+    code += '}\n'
+    return code
+
 def cb_full_tree(
     einsums:List[Einsum],
     capacity:int,
-    enforce_optimal_placement = True
+    enforce_optimal_placement = True,
+    emit_c_code:bool = False
 ):
     '''
     Full schedule-tree model for a chain of einsums, for fusion at various levels.
@@ -458,11 +577,12 @@ def cb_full_tree(
                 (spatial_cost[op], total_temporal_cost[op])
             )
 
-    model.Minimize(cp_model.LinearExpr.Sum(total_cost_vars.values()))
+    model.Minimize(cp_model.LinearExpr.Sum(list(total_cost_vars.values())))
 
     print("MODEL WRITING DONE")
 
     solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 300.0
     solver.Solve(model)
     print(solver.ResponseStats())
 
@@ -531,6 +651,21 @@ def cb_full_tree(
     for e_num in range(len(einsums)):
         print(f"Einsum {e_num} spatial costs:", [(o, solver.Value(spatial_cost[o])) for o in einsums[e_num].operand_dims])
         print(f"Einsum {e_num} temporal costs:", [(o, solver.Value(total_temporal_cost[o])) for o in einsums[e_num].operand_dims])
+    
+    if emit_c_code:
+        code = emit_c_program_chains(
+            [einsums],
+            solver,
+            all_operands,
+            all_operand_dims,
+            all_dim_sizes,
+            temporal_dim,
+            spatial_dim,
+            same_node,
+            parent,
+            op_allowed_temp_dims
+        )
+        return code
 
 if __name__ == '__main__':
     # cb_full_tree(
