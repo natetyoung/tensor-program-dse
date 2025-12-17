@@ -2,140 +2,181 @@
 #include <stdlib.h>
 #include <time.h>
 
-void einsum_0(float * restrict L0_X, float * restrict L0_WQ, float * restrict L0_Q) {
-    for (int m=0; m<128; m++) {
-        for (int k=0; k<512; k++) {
+void einsum_0(float * restrict L0_X, float * restrict L0_Q, float * restrict L0_WQ) {
+    for (int k0 = 0; k0 < 512; k0 += 1) {
+        for (int k0_i = 0; k0_i < ((k0 + 1 <= 512) ? 1 : (512 - k0)); k0_i++) {
+            int k = k0 + k0_i;
             float acc = 0.0f;
-            for (int d=0; d<512; d++) {
-                acc += L0_X[m*512 + d*1] * L0_WQ[d*512 + k*1];
+            for (int d = 0; d < 512; d++) {
+            for (int m = 0; m < 128; m++) {
+            acc += L0_X[m * 512 + d * 1] * L0_Q[m * 512 + k * 1];
             }
-            L0_Q[m*512 + k*1] = acc;
+            L0_WQ[d * 512 + k * 1] = acc;
+            }
         }
     }
 }
-void einsum_1(float * restrict L0_Q, float * restrict L0_K, float * restrict L0_S) {
-    for (int m=0; m<128; m++) {
-        for (int n=0; n<128; n++) {
+
+void einsum_1(float * restrict L0_S, float * restrict L0_Q, float * restrict L0_K) {
+    for (int k0 = 0; k0 < 512; k0 += 1) {
+        for (int k0_i = 0; k0_i < ((k0 + 1 <= 512) ? 1 : (512 - k0)); k0_i++) {
+            int k = k0 + k0_i;
             float acc = 0.0f;
-            for (int k=0; k<512; k++) {
-                acc += L0_Q[m*512 + k*1] * L0_K[n*512 + k*1];
+            for (int n = 0; n < 128; n++) {
+            for (int m = 0; m < 128; m++) {
+            acc += L0_S[m * 128 + n * 1] * L0_Q[m * 512 + k * 1];
             }
-            L0_S[m*128 + n*1] = acc;
+            L0_K[n * 512 + k * 1] = acc;
+            }
         }
     }
 }
+
 void einsum_2(float * restrict L0_S, float * restrict L0_V, float * restrict L0_O) {
-    for (int m_wrap=0; m_wrap<128; m_wrap++) {
-        int m_start = m_wrap * (128 / 128);
-        int m_end = (m_wrap == 128-1 ? 128 : m_start + (128 / 128));
-        for (int k_wrap=0; k_wrap<2; k_wrap++) {
-            int k_start = k_wrap * (512 / 2);
-            int k_end = (k_wrap == 2-1 ? 512 : k_start + (512 / 2));
-            for (int m=m_start; m<m_end; m++) {
-                for (int k=k_start; k<k_end; k++) {
-                    float acc = 0.0f;
-                    for (int n=0; n<128; n++) {
-                        acc += L0_S[m*128 + n*1] * L0_V[n*512 + k*1];
-                    }
-                    L0_O[m*512 + k*1] = acc;
-                }
-            }
-        }
-    }
-}
-void einsum_3(float * restrict L0_O, float * restrict L0_Wo, float * restrict L0_Y) {
-    for (int m=0; m<128; m++) {
-        for (int d=0; d<512; d++) {
+    for (int k0 = 0; k0 < 512; k0 += 1) {
+        for (int k0_i = 0; k0_i < ((k0 + 1 <= 512) ? 1 : (512 - k0)); k0_i++) {
+            int k = k0 + k0_i;
             float acc = 0.0f;
-            for (int k=0; k<512; k++) {
-                acc += L0_O[m*512 + k*1] * L0_Wo[k*512 + d*1];
+            for (int m = 0; m < 128; m++) {
+            for (int n = 0; n < 128; n++) {
+            acc += L0_S[m * 128 + n * 1] * L0_V[n * 512 + k * 1];
             }
-            L0_Y[m*512 + d*1] = acc;
+            L0_O[m * 512 + k * 1] = acc;
+            }
         }
     }
 }
+
+void einsum_3(float * restrict L0_Y, float * restrict L0_Wo, float * restrict L0_O) {
+    for (int k0 = 0; k0 < 512; k0 += 1) {
+        for (int k0_i = 0; k0_i < ((k0 + 1 <= 512) ? 1 : (512 - k0)); k0_i++) {
+            int k = k0 + k0_i;
+            float acc = 0.0f;
+            for (int m = 0; m < 128; m++) {
+            for (int d = 0; d < 512; d++) {
+            acc += L0_Y[m * 512 + d * 1] * L0_Wo[k * 512 + d * 1];
+            }
+            L0_O[m * 512 + k * 1] = acc;
+            }
+        }
+    }
+}
+
 void einsum_4(float * restrict L0_Y, float * restrict L0_W1, float * restrict L0_H) {
-    for (int f_wrap=0; f_wrap<2048; f_wrap++) {
-        int f_start = f_wrap * (2048 / 2048);
-        int f_end = (f_wrap == 2048-1 ? 2048 : f_start + (2048 / 2048));
-        for (int m=0; m<128; m++) {
-            for (int f=f_start; f<f_end; f++) {
-                float acc = 0.0f;
-                for (int d=0; d<512; d++) {
-                    acc += L0_Y[m*512 + d*1] * L0_W1[d*2048 + f*1];
+    for (int m0 = 0; m0 < 128; m0 += 64) {
+        for (int f0 = 0; f0 < 2048; f0 += 1) {
+            for (int m0_i = 0; m0_i < ((m0 + 64 <= 128) ? 64 : (128 - m0)); m0_i++) {
+                int m = m0 + m0_i;
+                for (int f0_i = 0; f0_i < ((f0 + 1 <= 2048) ? 1 : (2048 - f0)); f0_i++) {
+                    int f = f0 + f0_i;
+                    float acc = 0.0f;
+                    for (int d = 0; d < 512; d++) {
+                    acc += L0_Y[m * 512 + d * 1] * L0_W1[d * 2048 + f * 1];
+                    }
+                    L0_H[m * 2048 + f * 1] = acc;
                 }
-                L0_H[m*2048 + f*1] = acc;
             }
         }
     }
 }
-void einsum_5(float * restrict L0_H, float * restrict L0_W2, float * restrict L0_Z) {
-    for (int m_wrap=0; m_wrap<2; m_wrap++) {
-        int m_start = m_wrap * (128 / 2);
-        int m_end = (m_wrap == 2-1 ? 128 : m_start + (128 / 2));
-        for (int m=m_start; m<m_end; m++) {
-            for (int d=0; d<512; d++) {
-                float acc = 0.0f;
-                for (int f=0; f<2048; f++) {
-                    acc += L0_H[m*2048 + f*1] * L0_W2[f*512 + d*1];
+
+void einsum_5(float * restrict L0_Z, float * restrict L0_H, float * restrict L0_W2) {
+    for (int m0 = 0; m0 < 128; m0 += 64) {
+        for (int f0 = 0; f0 < 2048; f0 += 1) {
+            for (int m0_i = 0; m0_i < ((m0 + 64 <= 128) ? 64 : (128 - m0)); m0_i++) {
+                int m = m0 + m0_i;
+                for (int f0_i = 0; f0_i < ((f0 + 1 <= 2048) ? 1 : (2048 - f0)); f0_i++) {
+                    int f = f0 + f0_i;
+                    float acc = 0.0f;
+                    for (int d = 0; d < 512; d++) {
+                    acc += L0_Z[m * 512 + d * 1] * L0_H[m * 2048 + f * 1];
+                    L0_W2[f * 512 + d * 1] = acc;
+                    }
                 }
-                L0_Z[m*512 + d*1] = acc;
             }
         }
     }
 }
+
 int main() {
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
 
-    float * restrict L0_H = (float*)malloc(sizeof(float) * 262144);
-    for (int i=0;i<262144;i++) L0_H[i] = 1.0f;
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        float * restrict L0_X = (float*)malloc(sizeof(float) * 65536);
 
-    float * restrict L0_K = (float*)malloc(sizeof(float) * 65536);
-    for (int i=0;i<65536;i++) L0_K[i] = 1.0f;
+    for (int i = 0; i < 65536; i++)
+        L0_X[i] = 1.0f;
+    
+        float * restrict L0_WQ = (float*)malloc(sizeof(float) * 262144);
 
-    float * restrict L0_O = (float*)malloc(sizeof(float) * 65536);
-    for (int i=0;i<65536;i++) L0_O[i] = 1.0f;
+    for (int i = 0; i < 262144; i++)
+        L0_WQ[i] = 1.0f;
+    
+        float * restrict L0_Q = (float*)malloc(sizeof(float) * 65536);
 
-    float * restrict L0_Q = (float*)malloc(sizeof(float) * 65536);
-    for (int i=0;i<65536;i++) L0_Q[i] = 1.0f;
+    for (int i = 0; i < 65536; i++)
+        L0_Q[i] = 1.0f;
+    
+        float * restrict L0_K = (float*)malloc(sizeof(float) * 65536);
 
-    float * restrict L0_S = (float*)malloc(sizeof(float) * 16384);
-    for (int i=0;i<16384;i++) L0_S[i] = 1.0f;
+    for (int i = 0; i < 65536; i++)
+        L0_K[i] = 1.0f;
+    
+        float * restrict L0_S = (float*)malloc(sizeof(float) * 16384);
 
-    float * restrict L0_V = (float*)malloc(sizeof(float) * 65536);
-    for (int i=0;i<65536;i++) L0_V[i] = 1.0f;
+    for (int i = 0; i < 16384; i++)
+        L0_S[i] = 1.0f;
+    
+        float * restrict L0_V = (float*)malloc(sizeof(float) * 65536);
 
-    float * restrict L0_W1 = (float*)malloc(sizeof(float) * 1048576);
-    for (int i=0;i<1048576;i++) L0_W1[i] = 1.0f;
+    for (int i = 0; i < 65536; i++)
+        L0_V[i] = 1.0f;
+    
+        float * restrict L0_O = (float*)malloc(sizeof(float) * 65536);
 
-    float * restrict L0_W2 = (float*)malloc(sizeof(float) * 1048576);
-    for (int i=0;i<1048576;i++) L0_W2[i] = 1.0f;
+    for (int i = 0; i < 65536; i++)
+        L0_O[i] = 1.0f;
+    
+        float * restrict L0_Wo = (float*)malloc(sizeof(float) * 262144);
 
-    float * restrict L0_WQ = (float*)malloc(sizeof(float) * 262144);
-    for (int i=0;i<262144;i++) L0_WQ[i] = 1.0f;
+    for (int i = 0; i < 262144; i++)
+        L0_Wo[i] = 1.0f;
+    
+        float * restrict L0_Y = (float*)malloc(sizeof(float) * 65536);
 
-    float * restrict L0_Wo = (float*)malloc(sizeof(float) * 262144);
-    for (int i=0;i<262144;i++) L0_Wo[i] = 1.0f;
+    for (int i = 0; i < 65536; i++)
+        L0_Y[i] = 1.0f;
+    
+        float * restrict L0_W1 = (float*)malloc(sizeof(float) * 1048576);
 
-    float * restrict L0_X = (float*)malloc(sizeof(float) * 65536);
-    for (int i=0;i<65536;i++) L0_X[i] = 1.0f;
+    for (int i = 0; i < 1048576; i++)
+        L0_W1[i] = 1.0f;
+    
+        float * restrict L0_H = (float*)malloc(sizeof(float) * 262144);
 
-    float * restrict L0_Y = (float*)malloc(sizeof(float) * 65536);
-    for (int i=0;i<65536;i++) L0_Y[i] = 1.0f;
+    for (int i = 0; i < 262144; i++)
+        L0_H[i] = 1.0f;
+    
+        float * restrict L0_W2 = (float*)malloc(sizeof(float) * 1048576);
 
-    float * restrict L0_Z = (float*)malloc(sizeof(float) * 65536);
-    for (int i=0;i<65536;i++) L0_Z[i] = 1.0f;
+    for (int i = 0; i < 1048576; i++)
+        L0_W2[i] = 1.0f;
+    
+        float * restrict L0_Z = (float*)malloc(sizeof(float) * 65536);
 
-    einsum_0(L0_X, L0_WQ, L0_Q);
-    einsum_1(L0_Q, L0_K, L0_S);
-    einsum_2(L0_S, L0_V, L0_O);
-    einsum_3(L0_O, L0_Wo, L0_Y);
-    einsum_4(L0_Y, L0_W1, L0_H);
-    einsum_5(L0_H, L0_W2, L0_Z);
+    for (int i = 0; i < 65536; i++)
+        L0_Z[i] = 1.0f;
+    
+einsum_0(L0_X, L0_Q, L0_WQ);
+einsum_1(L0_S, L0_Q, L0_K);
+einsum_2(L0_S, L0_V, L0_O);
+einsum_3(L0_Y, L0_Wo, L0_O);
+einsum_4(L0_Y, L0_W1, L0_H);
+einsum_5(L0_Z, L0_H, L0_W2);
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double t = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9;
-    printf("Time: %f\n", t);
-    return 0;
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double t = (end.tv_sec - start.tv_sec) +
+                   (end.tv_nsec - start.tv_nsec) * 1e-9;
+        printf("Time: %f\n", t);
+        return 0;
 }

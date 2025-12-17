@@ -21,9 +21,9 @@ for i in "${!sizes[@]}"; do
     exe_file="${src_dir}${size}gpt.out"
     
     echo "Compiling $src_file with clang ..."
-    clang -O0 -fno-vectorize -fno-unroll-loops -o "$exe_file" "$src_file"
+    clang -O3 -fno-vectorize -fno-slp-vectorize -fno-unroll-loops -o "$exe_file" "$src_file"
     
-    for run in {1..5}; do
+    for run in {1..10}; do
         log_file="${log_dir}${size}gpt_run${run}.log"
         echo "Running $exe_file (run $run) ... logging to $log_file"
         "$exe_file" > "$log_file" 2>&1
@@ -36,9 +36,9 @@ for i in "${!sizes[@]}"; do
         exe_file="${src_dir}${size}gpt_opt_${cap}.out"
     
         echo "Compiling $src_file with clang ..."
-        clang -O0 -fno-vectorize -fno-unroll-loops -o "$exe_file" "$src_file"
+        clang -O0 -o "$exe_file" "$src_file"
     
-        for run in {1..5}; do
+        for run in {1..10}; do
             log_file="${log_dir}${size}gpt_opt_${cap}_run${run}.log"
             echo "Running $exe_file (run $run) ... logging to $log_file"
             "$exe_file" > "$log_file" 2>&1

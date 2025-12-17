@@ -24,7 +24,7 @@ for i, size in enumerate(sizes):
     
     # --- Unoptimized runs ---
     times = []
-    for run in range(1, 6):
+    for run in range(1, 11):
         log_file = os.path.join(log_dir, f"{size}gpt_run{run}.log")
         if not os.path.exists(log_file):
             continue
@@ -40,7 +40,7 @@ for i, size in enumerate(sizes):
     # --- Optimized runs ---
     for cap in caps[i]:
         times = []
-        for run in range(1, 6):
+        for run in range(1, 11):
             log_file = os.path.join(log_dir, f"{size}gpt_opt_{cap}_run{run}.log")
             if not os.path.exists(log_file):
                 continue
@@ -49,7 +49,9 @@ for i, size in enumerate(sizes):
                 match = time_pattern.search(content)
                 if match:
                     times.append(float(match.group(1)))
+  
         if times:
+            print(f"{size} {cap if cap != 'N/A' else 'unopt'}: {len(times)} runs -> {times}")
             avg_time = sum(times) / len(times)
             results.append([size, "opt", cap, avg_time])
 

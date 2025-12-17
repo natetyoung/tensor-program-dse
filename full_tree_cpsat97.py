@@ -1,5 +1,6 @@
 from typing import Dict, List, Tuple
 from ortools.sat.python import cp_model
+from c_from_cpsat import emit_c_driver, emit_einsum_function, parse_indented_trace, extract_loops_and_operands
 
 def add_mul_chain(model:cp_model.CpModel, components, lb, ub, pfx):
     old_var = components[0]
@@ -21,178 +22,6 @@ class Einsum:
         self.output_operand:str = output_operand
         self.dim_sizes:Dict[str,int] = dim_sizes
 
-def compute_strides(dims, all_dim_sizes):
-    strides = {}
-    stride = 1
-    for d in reversed(dims):
-        strides[d] = stride
-        stride *= all_dim_sizes[d]
-    return strides
-
-def emit_c_code_section(
-    einsum,
-    einsum_idx,
-    all_dim_sizes,
-    temporal_dim,
-    solver,
-    op_allowed_temp_dims,
-):
-    """
-    Emit a mathematically correct einsum kernel with wrap/temporal factors.
-    """
-    ops = list(einsum.operand_dims.keys())
-    out = einsum.output_operand
-    inputs = [o for o in ops if o != out]
-
-    # Dimensions
-    out_dims = einsum.operand_dims[out]
-    in_dims = {o: einsum.operand_dims[o] for o in inputs}
-
-    # Contracted dims = appear in inputs but not output
-    contracted = sorted(
-        set(d for o in inputs for d in in_dims[o]) - set(out_dims)
-    )
-
-    # Strides
-    def compute_strides(dims, sizes):
-        strides = {}
-        stride = 1
-        for d in reversed(dims):
-            strides[d] = stride
-            stride *= sizes[d]
-        return strides
-
-    out_strides = compute_strides(out_dims, all_dim_sizes)
-    in_strides = {o: compute_strides(in_dims[o], all_dim_sizes) for o in inputs}
-
-    code = []
-    code.append(
-        f"void einsum_{einsum_idx}("
-        + ", ".join([f"float * restrict {o}" for o in inputs + [out]])
-        + ") {"
-    )
-
-    indent = 1
-
-    # ---- temporal wrap loops ----
-    for dim in op_allowed_temp_dims[out]:
-        factor = solver.Value(temporal_dim[out][dim])
-        if factor > 1:
-            code.append(
-                "    " * indent
-                + f"for (int {dim}_wrap=0; {dim}_wrap<{factor}; {dim}_wrap++) {{"
-            )
-            code.append(
-                "    " * (indent + 1)
-                + f"int {dim}_start = {dim}_wrap * ({all_dim_sizes[dim]} / {factor});"
-            )
-            code.append(
-                "    " * (indent + 1)
-                + f"int {dim}_end = ({dim}_wrap == {factor}-1 ? {all_dim_sizes[dim]} : {dim}_start + ({all_dim_sizes[dim]} / {factor}));"
-            )
-            indent += 1
-
-    # ---- output loops ----
-    for d in out_dims:
-        if solver.Value(temporal_dim[out][d]) > 1:
-            code.append(
-                "    " * indent + f"for (int {d}={d}_start; {d}<{d}_end; {d}++) {{"
-            )
-        else:
-            code.append(
-                "    " * indent + f"for (int {d}=0; {d}<{all_dim_sizes[d]}; {d}++) {{"
-            )
-        indent += 1
-
-    # accumulator
-    code.append("    " * indent + "float acc = 0.0f;")
-
-    # ---- reduction loops ----
-    for d in contracted:
-        code.append(
-            "    " * indent + f"for (int {d}=0; {d}<{all_dim_sizes[d]}; {d}++) {{"
-        )
-        indent += 1
-
-    # ---- load * load ----
-    def index_expr(op, dims, strides):
-        return " + ".join([f"{d}*{strides[d]}" for d in dims])
-
-    mul_terms = []
-    for o in inputs:
-        mul_terms.append(f"{o}[{index_expr(o, in_dims[o], in_strides[o])}]")
-
-    code.append("    " * indent + f"acc += {' * '.join(mul_terms)};")
-
-    # close reduction loops
-    for _ in contracted:
-        indent -= 1
-        code.append("    " * indent + "}")
-
-    # ---- store ----
-    code.append(
-        "    " * indent + f"{out}[{index_expr(out, out_dims, out_strides)}] = acc;"
-    )
-
-    # close output loops
-    for _ in out_dims:
-        indent -= 1
-        code.append("    " * indent + "}")
-
-    # close temporal wrap loops
-    for dim in op_allowed_temp_dims[out]:
-        factor = solver.Value(temporal_dim[out][dim])
-        if factor > 1:
-            indent -= 1
-            code.append("    " * indent + "}")
-
-    code.append("}\n")
-    return "\n".join(code)
-
-
-def emit_c_program_chains(chains, solver, all_operands, all_operand_dims, all_dim_sizes,
-                          temporal_dim, spatial_dim, same_node, parent, op_allowed_temp_dims):
-    """Emit C program with separate functions for each einsum."""
-    code = '#include <stdio.h>\n#include <stdlib.h>\n#include <time.h>\n\n'
-
-    # Emit functions
-    for chain_idx, chain in enumerate(chains):
-        for e_idx, einsum in enumerate(chain):
-            code += emit_c_code_section(
-                einsum,
-                einsum_idx=e_idx,
-                all_dim_sizes=all_dim_sizes,
-                temporal_dim=temporal_dim,
-                solver=solver,
-                op_allowed_temp_dims=op_allowed_temp_dims,
-            )
-
-    # Emit main
-    code += 'int main() {\n'
-    code += '    struct timespec start, end;\n'
-    code += '    clock_gettime(CLOCK_MONOTONIC, &start);\n\n'
-
-    # Allocate arrays
-    for op in sorted(all_operands):
-        dims = all_operand_dims[op]
-        total_size = 1
-        for d in dims:
-            total_size *= all_dim_sizes[d]
-        code += f'    float * restrict {op} = (float*)malloc(sizeof(float) * {total_size});\n'
-        code += f'    for (int i=0;i<{total_size};i++) {op}[i] = 1.0f;\n\n'
-
-    # Call functions
-    for chain in chains:
-        for e_idx, einsum in enumerate(chain):
-            params = [op for op in einsum.operand_dims.keys()]
-            code += f'    einsum_{e_idx}({", ".join(params)});\n'
-
-    code += '\n    clock_gettime(CLOCK_MONOTONIC, &end);\n'
-    code += '    double t = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9;\n'
-    code += '    printf("Time: %f\\n", t);\n'
-    code += '    return 0;\n'
-    code += '}\n'
-    return code
 
 def cb_full_tree(
     einsums:List[Einsum],
@@ -659,6 +488,7 @@ def cb_full_tree(
         ])
 
     # print tree structure
+    traces = []
     for e in einsums:
         # find path of operands
         full_path = []
@@ -689,18 +519,24 @@ def cb_full_tree(
         full_path = list(reversed(full_path))
         print('Einsum operands path:', ' -> '.join([str(n) for n in full_path]))
         indent_level = 0
+        trace = []
         for level in full_path:
             # print temporal dims here if >1, indenting after each, then print all participating ops in level
             for dim in op_allowed_temp_dims[level[0]]:
                 dim_factor = solver.Value(temporal_dim[level[0]][dim])
                 if dim_factor > 1:
                     print(' ' * indent_level + dim + ' wrap', dim_factor)
+                    trace.append(' ' * indent_level + dim + ' wrap ' + str(dim_factor))
                     indent_level += 1
             for op in level:
                 if op in e.operand_dims.keys():
                     print(' ' * indent_level + 'LD/ST ' + op + ' ' + str({
                         d: solver.Value(spatial_dim[op][d]) for d in spatial_dim[op].keys()
                     }))
+                    trace.append(' ' * indent_level + 'LD/ST ' + op + ' ' + str({
+                        d: solver.Value(spatial_dim[op][d]) for d in spatial_dim[op].keys()
+                    }))
+        traces.append(trace)
     
     # print per-einsum costs
     for e_num in range(len(einsums)):
@@ -708,19 +544,24 @@ def cb_full_tree(
         print(f"Einsum {e_num} temporal costs:", [(o, solver.Value(total_temporal_cost[o])) for o in einsums[e_num].operand_dims])
     
     if emit_c_code:
-        code = emit_c_program_chains(
-            [einsums],
-            solver,
-            all_operands,
-            all_operand_dims,
-            all_dim_sizes,
-            temporal_dim,
-            spatial_dim,
-            same_node,
-            parent,
-            op_allowed_temp_dims
-        )
-        return code
+        einsum_functions = []
+        einsum_calls = []
+        tensor_sizes = {}
+        for i, e in enumerate(einsums):
+            name = f"einsum_{i}"
+            nodes = parse_indented_trace(traces[i])
+            _, operands = extract_loops_and_operands(nodes)
+            einsum_functions.append((name, emit_einsum_function(name, nodes, all_dim_sizes)))
+            einsum_calls.append((name, operands.keys()))
+        for op, dims in all_operand_dims.items():
+            tensor_sizes[op] = 1
+            for d in dims:
+                tensor_sizes[op] *= all_dim_sizes[d]
+        #print("einsum_functions", einsum_functions)
+        #print("einsum_calls", einsum_calls)
+        #print("tensor_sizes", tensor_sizes)
+        return emit_c_driver(einsum_functions, tensor_sizes, einsum_calls)
+        
 
 if __name__ == '__main__':
     # cb_full_tree(
