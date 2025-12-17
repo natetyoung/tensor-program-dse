@@ -549,9 +549,10 @@ def cb_full_tree(
         tensor_sizes = {}
         for i, e in enumerate(einsums):
             name = f"einsum_{i}"
+            output = e.output_operand
             nodes = parse_indented_trace(traces[i])
             _, operands = extract_loops_and_operands(nodes)
-            einsum_functions.append((name, emit_einsum_function(name, nodes, all_dim_sizes)))
+            einsum_functions.append((name, emit_einsum_function(name, nodes, all_dim_sizes, output)))
             einsum_calls.append((name, operands.keys()))
         for op, dims in all_operand_dims.items():
             tensor_sizes[op] = 1

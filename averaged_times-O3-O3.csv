@@ -1,0 +1,17 @@
+size,option,capacity,avg_time_sec
+tiny,unopt,N/A,0.0008058
+tiny,opt,4096,0.0003706
+tiny,opt,8192,0.00047799999999999996
+tiny,opt,16384,0.0003878
+small,unopt,N/A,0.0067888
+small,opt,4096,0.004105
+small,opt,8192,0.0030004
+small,opt,16384,0.0029158
+med,unopt,N/A,0.0358932
+med,opt,4096,0.028004
+med,opt,8192,0.025999
+med,opt,16384,0.028292400000000002
+huge,unopt,N/A,62.1979504
+huge,opt,4096,11.396286800000002
+huge,opt,8192,17.026373
+huge,opt,16384,92.80004540000002

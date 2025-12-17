@@ -130,78 +130,63 @@ if __name__ == "__main__":
         seq_len=32,
         model_dim=128,
         prefix="L0"
-    )
+    )[:3]
     small_layer = gpt_layer_einsums(
         batch=1,
         seq_len=64,
         model_dim=256,
         prefix="L0"
-    )
+    )[:3]
     med_layer = gpt_layer_einsums(
         batch=1,
         seq_len=128,
         model_dim=512,
         prefix="L0"
-    )
-    large_layer = gpt_layer_einsums(
-        batch=1,
-        seq_len=256,
-        model_dim=1024,
-        prefix="L0"
-    )
+    )[:3]
     huge_layer = gpt_layer_einsums(
         batch=1,
-        seq_len=2048,
+        seq_len=1024,
         model_dim=4096,
         prefix="L0"
-    )
+    )[:3]
+
+    caps = [4*1024, 8*1024, 16*1024]
 
     for e in tiny_layer:
         print(e.operand_dims, "->", e.output_operand)
 
     c_code = emit_c_program(tiny_layer)
-    with open("../../tinygpt.c", "w") as f:
+    with open("../../tiny_gpt/tinygpt.c", "w") as f:
         f.write(c_code)
-    caps = [8*1024, 16*1024, 32*1024]
+    
     for cap in caps:
         c_code = emit_c_program(tiny_layer, optimized=True, capacity=cap)
-        with open(f"../../tinygpt_opt_{cap}.c", "w") as f:
+        with open(f"../../tiny_gpt/tinygpt_opt_{cap}.c", "w") as f:
             f.write(c_code)
     
     c_code = emit_c_program(small_layer)
-    with open("../../smallgpt.c", "w") as f:
+    with open("../../small_gpt/smallgpt.c", "w") as f:
         f.write(c_code)
 
-    caps = [32*1024, 64*1024, 128*1024]
     for cap in caps:
         c_code = emit_c_program(small_layer, optimized=True, capacity=cap)
-        with open(f"../../smallgpt_opt_{cap}.c", "w") as f:
+        with open(f"../../small_gpt/smallgpt_opt_{cap}.c", "w") as f:
             f.write(c_code)
 
     c_code = emit_c_program(med_layer)
-    with open("../../medgpt.c", "w") as f:
+    with open("../../med_gpt/medgpt.c", "w") as f:
         f.write(c_code)
 
-    caps = [64*1024, 128*1024, 256*1024]
     for cap in caps:
         c_code = emit_c_program(med_layer, optimized=True, capacity=cap)
-        with open(f"../../medgpt_opt_{cap}.c", "w") as f:
-            f.write(c_code)
-
-    c_code = emit_c_program(large_layer)
-    with open("../../largegpt.c", "w") as f:
-        f.write(c_code)
-
-    caps = [256*1024, 512*1024, 1024*1024]
-    for cap in caps:
-        c_code = emit_c_program(large_layer, optimized=True, capacity=cap)
-        with open(f"../../largegpt_opt_{cap}.c", "w") as f:
+        with open(f"../../med_gpt/medgpt_opt_{cap}.c", "w") as f:
             f.write(c_code)
     
-    #c_code = emit_c_program(huge_layer)
-    #with open("../../hugegpt.c", "w") as f:
-    #    f.write(c_code)
-#
-    #c_code = emit_c_program(huge_layer, optimized=True)
-    #with open("../../hugegpt_opt.c", "w") as f:
-    #    f.write(c_code)
+    c_code = emit_c_program(huge_layer)
+    with open("../../huge_gpt/hugegpt.c", "w") as f:
+        f.write(c_code)
+    
+    for cap in caps:
+        c_code = emit_c_program(huge_layer, optimized=True, capacity=cap)
+        with open(f"../../huge_gpt/hugegpt_opt_{cap}.c", "w") as f:
+            f.write(c_code)

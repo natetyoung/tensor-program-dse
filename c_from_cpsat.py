@@ -60,10 +60,6 @@ def extract_loops_and_operands(nodes: List[Node]):
 
     return wraps, operands
 
-def infer_output_operand(operands: Dict[str, List[str]]) -> str:
-    # simple, matches your trace printing order
-    return list(operands.keys())[-1]
-
 def infer_reduction_dims(operands, output, tiled_dims):
     out_dims = set(operands[output])
     all_dims = set(d for dims in operands.values() for d in dims)
@@ -134,7 +130,7 @@ def emit_compute(operands, output, dim_sizes, tiled_dims):
     lines = []
     indent = "    "
 
-    lines.append(indent + "float acc = 0.0f;")
+    #lines.append(indent + "float acc = 0.0f;")
 
     # reduction loops
     for d in out_dims:
@@ -152,18 +148,20 @@ def emit_compute(operands, output, dim_sizes, tiled_dims):
         idx = " + ".join(f"{d} * {strides[d]}" for d in operands[op])
         terms.append(f"{op}[{idx}]")
 
-    acc = indent + "acc += " + " * ".join(terms) + ";"
-    lines.append(acc)
+    #acc = indent + "acc += " + " * ".join(terms) + ";"
+    
+    # store
+    out_strides = strides_for(operands[output], dim_sizes)
+    out_idx = " + ".join(f"{d} * {out_strides[d]}" for d in operands[output])
+    lines.append(indent + f"{output}[{out_idx}] += " + " * ".join(terms) + ";")
+    #lines.append(acc)
 
     # close reduction loops
     for _ in red_dims:
         indent = indent[:-4]
         lines.append(indent + "}")
 
-    # store
-    out_strides = strides_for(operands[output], dim_sizes)
-    out_idx = " + ".join(f"{d} * {out_strides[d]}" for d in operands[output])
-    lines.append(indent + f"{output}[{out_idx}] = acc;")
+    #lines.append(indent + f"{output}[{out_idx}] = acc;")
 
     for _ in out_dims:
         indent = indent[:-4]
@@ -174,10 +172,11 @@ def emit_compute(operands, output, dim_sizes, tiled_dims):
 def emit_einsum_function(
     name: str,
     nodes: List[Node],
-    dim_sizes: Dict[str, int]
+    dim_sizes: Dict[str, int],
+    output: str,
 ) -> str:
     wraps, operands = extract_loops_and_operands(nodes)
-    output = infer_output_operand(operands)
+    output = output
 
     args = ", ".join(f"float * restrict {op}" for op in operands)
     lines = [f"void {name}({args}) {{"]
