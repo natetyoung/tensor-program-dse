@@ -30,11 +30,12 @@ def cb_full_tree(
     capacity:int,
     enforce_optimal_placement = True,
     emit_c_code:bool = False,
+    allow_spilling = False,
     debug:bool = True
 ):
     '''
     Full schedule-tree model for a chain of einsums, for fusion at various levels.
-    Disallows partial spilling or spilling of any intermediate.
+    Disallows partial spilling.
     Use unique names for operands except when they are being passed.
     '''
     '''
@@ -50,34 +51,17 @@ def cb_full_tree(
         - num_operands integer combined-for-all-resident spatial costs
         - num_total_operands^2 booleans for "A is parent of B"
         - num_total_operands^2 booleans for "A is ancestor of B"
-        - num_total_operands^2 booleans for "A is in the same node as B"
-        - num_total_operands^2 booleans for "A is a skew-ancestor of B"
-            (using n^3 booleans for "A is the same node as C which is B's ancestor", plus regular ancestor)
-        - num_total_operands^2 booleans for "A is a skew-parent of B"
-            (using n^3 booleans for "A is the same node as C which is B's parent", plus regular parent)
         - num_total_operands^2 booleans for "A and B must coexist in the fast memory"
     Constraints (not entirely exhaustive):
         Constraints so parent/ancestor relationships form a tree:
          - A parent of B implies A ancestor of B
          - A ancestor of B and B ancestor of C implies A ancestor of C
          - A ancestor of B implies B not ancestor of A
-         - A same node as B implies B same node as A
-         - A same node as B and B same node as C implies A same node as C
-         - A same node as B and C parent of A implies C parent of B
-         - A same node as B implies A not ancestor of B and B not ancestor of A
-         - Ancestorship must be provable inductively
-            (A ancestor of B implies for some C, A is an ancestor of C and C is the parent of A)
          - Each node has only one parent
         Sanity of factors in tree:
-         - A same node as B implies temporal-here factors equal
-         - A same node as B implies non-shared temporal-here factors all 1
          - A ancestor of B implies temporal-here factors in A which are not allowed for B are 1
-         - A same node as C and C ancestor of B implies same as above
         Consistency of einsums in tree:
-         - for all A, B in same einsum, either:
-          - A same node as B
-          - A (skew-)ancestor of B
-          - B (skew-)ancestor of A
+         - for all A, B in same einsum, either A ancestor B or B ancestor A
         Costs:
          - Product of own factors is spatial cost
          - Product of temporal-here factors is local temporal cost
@@ -108,22 +92,17 @@ def cb_full_tree(
     for i in range(len(einsums)):
         for op in einsums[i].operand_dims.keys():
             if op == einsums[i].output_operand and i < len(einsums) - 1:
-                assert op in einsums[i+1].operand_dims.keys()
-                assert einsums[i].operand_dims[op] == einsums[i+1].operand_dims[op]
+                assert op[-6:] == '_spill'
+                assert op[:-6] in einsums[i+1].operand_dims.keys()
+                assert einsums[i].operand_dims[op] == einsums[i+1].operand_dims[op[:-6]]
+                fused_operands.append(op[:-6])
+            for j in range(i+1, len(einsums)):
+                assert op not in einsums[j].operand_dims.keys()
+            if op == einsums[i].output_operand:
+                op_allowed_temp_dims[op] = list(einsums[i].operand_dims[op])
             else:
-                if i < len(einsums) - 1:
-                    assert op not in einsums[i+1].operand_dims.keys()
-            for j in range(i, len(einsums)):
-                if i != j and i+1 != j:
-                    assert op not in einsums[j].operand_dims.keys()
-            if op not in op_allowed_temp_dims:
-                if op == einsums[i].output_operand:
-                    op_allowed_temp_dims[op] = einsums[i].operand_dims[op]
-                else:
-                    op_allowed_temp_dims[op] = list(einsums[i].dim_sizes.keys())
+                op_allowed_temp_dims[op] = list(einsums[i].dim_sizes.keys())
             all_operand_dims[op] = einsums[i].operand_dims[op]
-            if op == einsums[i].output_operand and i < len(einsums) - 1:
-                fused_operands.append(op)
         for d in einsums[i].dim_sizes.keys():
             if d in all_dim_sizes:
                 assert einsums[i].dim_sizes[d] == all_dim_sizes[d]
@@ -131,64 +110,55 @@ def cb_full_tree(
                 all_dim_sizes[d] = einsums[i].dim_sizes[d]
 
     all_operands = list(all_operand_dims.keys())
+    if debug: print(all_operands)
 
     model = cp_model.CpModel()
 
-    # parent, ancestor, and same-node relationship variables
-    parent:Dict[str,Dict[str,cp_model.IntVar]] = {
+    # ancestor relationship variables
+    ancestor_overlap:Dict[str,Dict[str,cp_model.IntVar]] = {
         i: {
-            j: model.NewBoolVar('{}p{}'.format(i, j)) for j in all_operands if i != j
-        } for i in all_operands + ['ROOT']
-    } # ipj is "i is the parent of j"
+            j: model.NewBoolVar('{}_ao_{}'.format(i, j)) for j in all_operands if i != j
+        } for i in all_operands
+    } # i_ao_j is "i is an ancestor of j and the subtree rooted at j must happen while buffer i exists"
+    ancestor_not_overlap:Dict[str,Dict[str,cp_model.IntVar]] = {
+        i: {
+            j: model.NewBoolVar('{}_ano_{}'.format(i, j)) for j in all_operands if i != j
+        } for i in all_operands
+    } # i_ano_j is "i is an ancestor of j and the subtree rooted at j does not happen while buffer i exists"
     ancestor:Dict[str,Dict[str,cp_model.IntVar]] = {
         i: {
-            j: model.NewBoolVar('{}a{}'.format(i, j)) for j in all_operands if i != j
+            j: model.NewBoolVar('{}_a_{}'.format(i, j)) for j in all_operands if i != j
         } for i in all_operands
-    } #iaj is "i is an ancestor of j"
-    same_node:Dict[str,Dict[str,cp_model.IntVar]] = {
-        i: {
-            j: model.NewBoolVar('{}s{}'.format(i, j)) for j in all_operands if i != j
-        } for i in all_operands
-    }
+    } # i_a_j is "i is an ancestor of j"
+    # i_p_j = i_po_j OR i_pno_j
+    # i_a_j = i_ao_j OR i_ano_j
+    for i in all_operands + ['ROOT']:
+        for j in all_operands:
+            if i == j:
+                continue
+            if i != 'ROOT':
+                model.AddBoolOr(ancestor_overlap[i][j], ancestor_not_overlap[i][j]).OnlyEnforceIf(ancestor[i][j])
+                model.AddBoolAnd(ancestor_overlap[i][j].Not(), ancestor_not_overlap[i][j].Not()).OnlyEnforceIf(ancestor[i][j].Not())
 
-    # Constraints so parent/ancestor relationships form a tree
+
+    # Constraints so ancestor relationships form a tree
     for i in all_operands:
         for j in all_operands:
             if i == j:
                 continue
-            # A parent of B implies A ancestor of B
-            model.AddImplication(parent[i][j], ancestor[i][j])
-            # A same node as B implies A not ancestor of B
-            # (other direction will be taken care of by later iteration)
-            model.AddImplication(same_node[i][j], ancestor[i][j].Not())
             # A ancestor of B implies B not ancestor of A
-            # (other direction will be taken care of by later iteration)
-            model.AddImplication(ancestor[i][j], ancestor[j][i].Not())
-            # same-node commutativity
-            model.Add(same_node[i][j] == same_node[j][i])
-
-            ancestor_proof:Dict[str,cp_model.IntVar] = {}
+            model.AddAtMostOne([
+                ancestor_overlap[i][j], ancestor_not_overlap[i][j], ancestor_overlap[j][i], ancestor_not_overlap[j][i]
+            ])
             for k in all_operands:
                 if i == k or j == k:
                     continue
-                # A ancestor of B and B ancestor of C implies A ancestor of C
-                model.AddImplication(ancestor[i][j], ancestor[i][k]).OnlyEnforceIf(ancestor[j][k])
-                # A same node as B and C parent of A implies C parent of B
-                model.AddImplication(parent[k][i], parent[k][j]).OnlyEnforceIf(same_node[i][j])
-                # A same node as B and B same node as C implies A same node as C
-                model.AddImplication(same_node[i][j], same_node[i][k]).OnlyEnforceIf(same_node[j][k])
+                # A ancestor (overlap/not-overlap) of B and B ancestor (any kind) of C implies A ancestor (overlap/not-overlap) of C
+                model.Add(ancestor_overlap[i][k] == 1).OnlyEnforceIf(ancestor_overlap[i][j], ancestor[j][k])
+                model.Add(ancestor_not_overlap[i][k] == 1).OnlyEnforceIf(ancestor_not_overlap[i][j], ancestor[j][k])
 
-                # variable: k proves that i ancestor of j (k is parent of j and i ancestor of k)
-                ancestor_proof[k] = model.NewBoolVar('{}_pr_{}_anc_{}'.format(k, i, j))
-                model.AddBoolAnd(ancestor[i][k], parent[k][j]).OnlyEnforceIf(ancestor_proof[k])
-            # ancestorship must be provable
-            model.AddBoolOr(
-                [
-                    ancestor_proof[k] for k in all_operands if k != i and k != j
-                ] + [parent[i][j]]
-            ).OnlyEnforceIf(ancestor[i][j])
-        # Each node has only one parent
-        model.AddExactlyOne([parent[x][i] for x in all_operands + ['ROOT'] if x != i])
+                # Consistency of ancestorship
+                model.AddBoolOr(ancestor[i][j], ancestor[j][i]).OnlyEnforceIf(ancestor[i][k], ancestor[j][k])
 
     # Spatial dim vars: operand to dim to var
     spatial_dim:Dict[str,Dict[str,cp_model.IntVar]] = {
@@ -208,59 +178,46 @@ def cb_full_tree(
         for j in all_operands:
             if i == j:
                 continue
-            # A same node as B implies temporal-here factors equal
-            for dim in op_allowed_temp_dims[i]:
-                if dim in op_allowed_temp_dims[j]:
-                    model.Add(temporal_dim[i][dim] == temporal_dim[j][dim]).OnlyEnforceIf(same_node[i][j])
-            # A same node as B implies non-shared temporal-here factors all 1
-            for dim in op_allowed_temp_dims[i]:
-                if dim not in op_allowed_temp_dims[j]:
-                    model.Add(temporal_dim[i][dim] == 1).OnlyEnforceIf(same_node[i][j])
             # A ancestor of B implies temporal-here factors in A which are not allowed for B are 1
             for dim in op_allowed_temp_dims[i]:
                 if dim not in op_allowed_temp_dims[j]:
                     model.Add(temporal_dim[i][dim] == 1).OnlyEnforceIf(ancestor[i][j])
-            # A same node as C and C ancestor of B implies same as above
-            for k in all_operands:
-                if i == k or j == k:
-                    continue
-                for dim in op_allowed_temp_dims[i]:
-                    if dim not in op_allowed_temp_dims[j]:
-                        model.Add(temporal_dim[i][dim] == 1).OnlyEnforceIf(
-                            [same_node[i][k], ancestor[k][j]]
-                        )
-
-    # Skew-ancestry variables
-    skew_anc:Dict[str,Dict[str,cp_model.IntVar]] = {}
-    for op_a in all_operands:
-        skew_anc[op_a] = {}
-        for op_b in all_operands:
-            if op_a == op_b:
-                continue
-            skew_components = [ancestor[op_a][op_b]]
-            for op_c in all_operands:
-                if op_c == op_a or op_c == op_b:
-                    continue
-                # c proves a in ancestor of b
-                skew_a_b_c = model.NewBoolVar('skewa_{}_{}_{}'.format(op_a, op_b, op_c))
-                model.AddBoolAnd(same_node[op_c][op_a], ancestor[op_c][op_b]).OnlyEnforceIf(skew_a_b_c)
-                skew_components.append(skew_a_b_c)
-            skew_anc[op_a][op_b] = model.NewBoolVar('{op_a}_skew_anc_{op_b}')
-            model.AddBoolOr(skew_components).OnlyEnforceIf(skew_anc[op_a][op_b])
-            model.AddBoolAnd([v.Not() for v in skew_components]).OnlyEnforceIf(skew_anc[op_a][op_b].Not())
 
     # Constraints for consistency of einsums in tree
-    for e in einsums:
+    for i, e in enumerate(einsums):
         ops = list(e.operand_dims.keys())
         for op_a in ops:
             for op_b in ops:
                 if op_a == op_b:
                     continue
-                # either A same node as B, or B skew-ancestor of A, or A skew-ancestor of B
-                same_a_b = same_node[op_a][op_b]
-                skew_a_b = skew_anc[op_a][op_b]
-                skew_b_a = skew_anc[op_b][op_a]
-                model.AddBoolOr([same_a_b, skew_a_b, skew_b_a])
+                # either B is ancestor of A, or A is ancestor of B (OVERLAP)
+                model.AddBoolOr([ancestor_overlap[op_b][op_a], ancestor_overlap[op_a][op_b]])
+    
+    # Bool variables for whether we are fusing a particular operand
+    fuse_op:Dict[str,cp_model.BoolVar] = {}
+    for op in fused_operands:
+        fuse_op[op] = model.NewBoolVar('fuse_'+op)
+        # 1. Neither is an ancestor of the other
+        model.Add(ancestor[op][op+'_spill'] == 0)
+        model.Add(ancestor[op+'_spill'][op] == 0)
+        # 2. They have exactly the same ancestors with other nodes if fused
+        for other_op in all_operands:
+            if other_op == op or other_op == op+'_spill':
+                continue
+            model.Add(ancestor[other_op][op] == ancestor[other_op][op+'_spill']).OnlyEnforceIf(fuse_op[op])
+        # 3. They have exactly the same temporal dim factors if fused
+        for dim in op_allowed_temp_dims[op]:
+            if dim in op_allowed_temp_dims[op+'_spill']:
+                model.Add(temporal_dim[op][dim] == temporal_dim[op+'_spill'][dim]).OnlyEnforceIf(fuse_op[op])
+            else:
+                model.Add(temporal_dim[op][dim] == 1).OnlyEnforceIf(fuse_op[op])
+        for dim in op_allowed_temp_dims[op+'_spill']:
+            if dim not in op_allowed_temp_dims[op]:
+                model.Add(temporal_dim[op+'_spill'][dim] == 1).OnlyEnforceIf(fuse_op[op])
+
+        if not allow_spilling:
+            model.Add(fuse_op[op] == 1)
+            if debug: print(f'Forced fuse for {op}')
     
     # Costs
     spatial_cost:Dict[str,cp_model.IntVar] = {}
@@ -271,7 +228,7 @@ def cb_full_tree(
         op_size = 1
         for d in all_operand_dims[op]:
             op_size *= all_dim_sizes[d]
-        # Product of own factors is spatial cost
+        # Fused operand non-spatial-doublecounting should be taken care of by new coexistence constraints
         spatial_cost[op] = add_mul_chain(
             model,
             [spatial_dim[op][d] for d in all_operand_dims[op]],
@@ -285,7 +242,7 @@ def cb_full_tree(
         allowed_dim_product = 1
         for d in op_allowed_temp_dims[op]:
             allowed_dim_product *= all_dim_sizes[d]
-        max_temporal_cost = allowed_dim_product * (2**len(all_operands))
+        max_temporal_cost = allowed_dim_product * (2**len(op_allowed_temp_dims[op]))
         temporal_dim_contribs[op] = {}
         for other_op in all_operands:
             if op == other_op:
@@ -320,8 +277,17 @@ def cb_full_tree(
                 model.AddMultiplicationEquality(total_size, [spatial_dim[op][d], total_temporal_dim[op][d]])
                 model.Add(total_size >= all_dim_sizes[d])
 
-        if op in fused_operands:
-            total_temporal_cost[op] = model.NewIntVar(0, 0, 'total_temporal_cost_'+op)
+        if op in fused_operands or op.endswith('_spill'):
+            total_temporal_cost[op] = model.NewIntVar(0, max_temporal_cost, 'total_temporal_cost_'+op)
+            temporal_if_not_fused_cost = add_mul_chain(
+                model,
+                list(total_temporal_dim[op].values()),
+                1, max_temporal_cost,
+                'temporal_if_not_fused_'+op
+            )
+            restore_op_name = op if op in fused_operands else op.replace('_spill', '')
+            model.Add(total_temporal_cost[op] == 0).OnlyEnforceIf(fuse_op[restore_op_name])
+            model.Add(total_temporal_cost[op] == temporal_if_not_fused_cost).OnlyEnforceIf(fuse_op[restore_op_name].Not())
         else:
             total_temporal_cost[op] = add_mul_chain(
                 model,
@@ -331,15 +297,6 @@ def cb_full_tree(
             )
     
     # Capacity
-    # when don't two buffers A and B need to coexist?
-    # 1. neither is a (skew-)ancestor of the other OR
-    # 2. A is an ancestor of B, but:
-    #   all A's producers (if it is an output) or its consumers (if it is an input)
-    #   have the A node or further out as the least common ancestor with B
-    # so they do need to coexist if:
-    # 1. A is a (skew-)ancestor of B AND
-    # 2. at least one of A's fellow operands in an einsum has a LCA with B which is (skew-)descended from A
-    # 2 in other words: some C exists where A ancestor of C, C ancestor of both B and some other operand with A
     coexist_vars:Dict[str,Dict[str,cp_model.IntVar]] = {}
     for op_a in all_operands:
         coexist_vars[op_a] = {}
@@ -348,74 +305,17 @@ def cb_full_tree(
                 continue
             coexist_var = model.NewBoolVar('coexist_{}_{}'.format(op_a, op_b))
             coexist_vars[op_a][op_b] = coexist_var
-            for e in einsums:
-                if op_a in e.operand_dims.keys() and op_b in e.operand_dims.keys():
-                    model.Add(coexist_var == 1)
-            for e in einsums:
-                if op_a not in e.operand_dims.keys():
-                    continue
-                problematic_operands = []
-                if op_a == e.output_operand:
-                    problematic_operands = [o for o in e.operand_dims.keys() if o != op_a and o != op_b]
-                else:
-                    problematic_operands = [e.output_operand]
-                for op_d in problematic_operands:
-                    if op_a == op_d or op_b == op_d:
-                        continue
-                    for op_c in all_operands:
-                        if op_c == op_d:
-                            continue
-                        if op_c == op_b:
-                            model.AddBoolOr(
-                                skew_anc[op_b][op_d].Not(), skew_anc[op_a][op_b].Not()
-                            ).OnlyEnforceIf(
-                                coexist_var.Not()
-                            )
-                        elif op_c != op_a:
-                            anc_a_c = skew_anc[op_a][op_c]
-                            anc_c_b = skew_anc[op_c][op_b]
-                            anc_c_d = skew_anc[op_c][op_d]
-                            # none of B's skew-ancestors before A are skew-ancestors of D
-                            model.AddBoolOr(
-                                anc_a_c.Not(), anc_c_b.Not(), anc_c_d.Not(), skew_anc[op_a][op_b].Not()
-                            ).OnlyEnforceIf(
-                                coexist_var.Not()
-                            )
-                        # B is not itself a skew-ancestor of D
-                        model.AddBoolOr(
-                            skew_anc[op_b][op_d].Not(), skew_anc[op_a][op_b].Not()
-                        ).OnlyEnforceIf(
-                            coexist_var.Not()
-                        )
-                        # D is not itself a skew-ancestor of B before A
-                        model.AddBoolOr(
-                            skew_anc[op_a][op_d].Not(), skew_anc[op_d][op_b].Not(), skew_anc[op_a][op_b].Not()
-                        ).OnlyEnforceIf(
-                            coexist_var.Not()
-                        )
-                    # B is not colocated with D
-                    model.AddBoolOr(
-                        same_node[op_b][op_d].Not(), skew_anc[op_a][op_b].Not()
-                    ).OnlyEnforceIf(
-                        coexist_var.Not()
-                    )
-    for op_a in all_operands:
-        for op_b in all_operands:
-            if op_a == op_b:
-                continue
-            model.Add(coexist_vars[op_a][op_b] == coexist_vars[op_b][op_a])
+            model.Add(ancestor_overlap[op_b][op_a] == coexist_var)
     
-    total_coexist_space:Dict[str,cp_model.IntVar] = {}
     for op in all_operands:
-        total_coexist_space[op] = model.NewIntVar(1, capacity, 'total_space_used_{op}')
         contrib_vars = []
         for op2 in all_operands:
             if op == op2:
                 continue
-            contrib_var = model.NewIntVar(1, capacity, 'space_contrib_{}_{}'.format(op, op2))
+            contrib_var = model.NewIntVar(0, capacity, 'space_contrib_{}_{}'.format(op, op2))
             contrib_vars.append(contrib_var)
             model.Add(contrib_var == spatial_cost[op2]).OnlyEnforceIf(coexist_vars[op][op2])
-            model.Add(contrib_var == 1).OnlyEnforceIf(coexist_vars[op][op2].Not())
+            model.Add(contrib_var == 0).OnlyEnforceIf(coexist_vars[op][op2].Not())
         # Real capacity constraint
         model.Add(cp_model.LinearExpr.Sum(contrib_vars) + spatial_cost[op] <= capacity)
 
@@ -423,28 +323,37 @@ def cb_full_tree(
         # Optional optimality sanity constraints
         for op in all_operands:
             for dim in op_allowed_temp_dims[op]:
-                # temporal factor is 1 if dim does not participate in this tensor or any assigned to same node
+                # temporal factor is 1 if dim does not participate in this tensor
                 if dim not in all_operand_dims[op]:
-                    model.Add(temporal_dim[op][dim] == 1).OnlyEnforceIf(
-                        *[
-                            same_node[op][other_op].Not() 
-                            for other_op in all_operands 
-                            if dim in all_operand_dims[other_op] and other_op != op
-                        ]
-                    )
-                # spatial factor is 1 if dim does participate in this and any same node or skew-descendants
-                if dim in all_operand_dims[op]:
+                    model.Add(temporal_dim[op][dim] == 1)
+                # spatial factor is 1 if dim does participate in this and any descendants
+                if op not in fused_operands and dim in all_operand_dims[op]:
                     model.Add(spatial_dim[op][dim] == 1).OnlyEnforceIf(
                         *([
-                            same_node[op][other_op].Not()
-                            for other_op in all_operands
-                            if dim not in all_operand_dims[other_op] and other_op != op
-                        ] + [
-                            skew_anc[op][other_op].Not()
+                            ancestor[op][other_op].Not()
                             for other_op in all_operands
                             if dim not in all_operand_dims[other_op] and other_op != op
                         ])
                     )
+
+        for i in range(len(einsums)-1):
+            for k in range(i+1):
+                for op in einsums[k].operand_dims.keys():
+                    for j in range(i+1, len(einsums)):
+                        for op2 in einsums[j].operand_dims.keys():
+                            if op == op2:
+                                continue
+                            model.Add(ancestor[op][op2] == 0).OnlyEnforceIf(fuse_op[fused_operands[i]].Not())
+                            model.Add(ancestor[op2][op] == 0).OnlyEnforceIf(fuse_op[fused_operands[i]].Not())
+                            model.Add(ancestor_overlap[fused_operands[i]+'_spill'][op2] == 0)
+                            model.Add(ancestor_not_overlap[fused_operands[i]+'_spill'][op2] == 0).OnlyEnforceIf(fuse_op[fused_operands[i]].Not())
+
+            for j in range(i):
+                for op2 in einsums[j].operand_dims.keys():
+                    if op == op2:
+                        continue
+                    model.Add(ancestor[fused_operands[i]][op2] == 0)
+                        
 
     # total cost vars
     total_cost_vars:Dict[str,cp_model.IntVar] = {}
@@ -455,41 +364,70 @@ def cb_full_tree(
         allowed_dim_product = 1
         for d in op_allowed_temp_dims[op]:
             allowed_dim_product *= all_dim_sizes[d]
-        if op in fused_operands:
-            total_cost_vars[op] = model.NewIntVar(0, 0, 'total_cost_'+op)
+        if op in fused_operands or op.endswith('_spill'):
+            total_cost_vars[op] = model.NewIntVar(0, allowed_dim_product * (2**len(op_allowed_temp_dims[op])), 'total_cost_'+op)
         else:
-            total_cost_vars[op] = model.NewIntVar(op_size, allowed_dim_product * (2**len(all_operands)), 'total_cost_'+op)
-            model.AddMultiplicationEquality(
-                total_cost_vars[op],
-                (spatial_cost[op], total_temporal_cost[op])
-            )
+            total_cost_vars[op] = model.NewIntVar(op_size, allowed_dim_product * (2**len(op_allowed_temp_dims[op])), 'total_cost_'+op)
+        model.AddMultiplicationEquality(
+            total_cost_vars[op],
+            (spatial_cost[op], total_temporal_cost[op])
+        )
 
     model.Minimize(cp_model.LinearExpr.Sum(list(total_cost_vars.values())))
 
     if debug: print("MODEL WRITING DONE")
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 300.0
+    # solver.parameters.max_time_in_seconds = 300.0
+    # model.AddAssumptions([parent['C_spill']['A']])
     solver.Solve(model)
-    if debug: print(solver.ResponseStats())
+    if debug:
+        print(solver.ResponseStats())
+        assumptions = solver.SufficientAssumptionsForInfeasibility()
+        print(len(assumptions))
+        for var_index in assumptions:
+            print(var_index, f"{var_index}: '{model.proto.variables[var_index].name}'")
+
+    implicit_parents:Dict[str,str] = {op: 'ROOT' for op in all_operands}
+    for op in all_operands:
+        for op2 in all_operands:
+            if op == op2:
+                continue
+            if solver.BooleanValue(ancestor[op][op2]):
+                nearest_ancestor = True
+                for op3 in all_operands:
+                    if op3 == op or op3 == op2:
+                        continue
+                    if solver.BooleanValue(ancestor[op][op3]) and solver.BooleanValue(ancestor[op3][op2]):
+                        nearest_ancestor = False
+                        break
+                if nearest_ancestor:
+                    implicit_parents[op2] = op
 
     if debug:
         for op in all_operands + ['ROOT']:
             for op2 in all_operands:
                 if op == op2:
                     continue
-                if solver.BooleanValue(parent[op][op2]):
-                    print(op, 'is the parent of', op2)
+                if implicit_parents[op2] == op: #solver.BooleanValue(parent[op][op2]):
+                    print(op, 'is the parent of', op2, 'overlap:', 
+                        solver.BooleanValue(ancestor_overlap[op][op2]) if op != 'ROOT' else False)
+                # if op != 'ROOT' and solver.BooleanValue(ancestor[op][op2]):
+                #     print(op, 'is an ancestor of', op2, 'overlap:', solver.BooleanValue(ancestor_overlap[op][op2]))
 
-        for op in all_operands:
-            for op2 in all_operands:
-                if op == op2:
-                    continue
-                if solver.BooleanValue(same_node[op][op2]):
-                    print(op, 'same node as', op2)
-            print(op, 'must coexist with', [
-                op2 for op2 in all_operands if op != op2 and solver.BooleanValue(coexist_vars[op][op2])
-            ])
+        # for op in all_operands:
+        #     print(op, 'must coexist with', [
+        #         op2 for op2 in all_operands if op != op2 and solver.BooleanValue(coexist_vars[op][op2])
+        #     ])
+        # for op2 in all_operands:
+        #     if op == op2: continue
+        #     if not solver.BooleanValue(coexist_vars[op][op2]):
+        #         print(op, 'does not coexist with', op2)
+        #         if op2 not in equal_temporal_dims[op]:
+        #             continue
+        #         print(op, 'has equal temporal dims with', op2, '?', solver.BooleanValue(equal_temporal_dims[op][op2]))
+        #         print(op, 'ancestor of', op2, '?', solver.BooleanValue(ancestor[op][op2]))
+        #         print(op2, 'ancestor of', op, '?', solver.BooleanValue(ancestor[op2][op]))
 
     # print tree structure
     traces = []
@@ -506,12 +444,10 @@ def cb_full_tree(
                 for op2 in e.operand_dims.keys():
                     if current == op2:
                         continue
-                    if solver.BooleanValue(same_node[current][op2]):
-                        path[-1].append(op2)
                 for potential_parent in all_operands + ['ROOT']:
                     if potential_parent == current:
                         continue
-                    if solver.BooleanValue(parent[potential_parent][current]):
+                    if implicit_parents[current] == potential_parent: #solver.BooleanValue(parent[potential_parent][current]):
                         if potential_parent == 'ROOT':
                             current = potential_parent
                             break
@@ -553,10 +489,9 @@ def cb_full_tree(
         tensor_sizes = {}
         for i, e in enumerate(einsums):
             name = f"einsum_{i}"
-            output = e.output_operand
             nodes = parse_indented_trace(traces[i])
             _, operands = extract_loops_and_operands(nodes)
-            einsum_functions.append((name, emit_einsum_function(name, nodes, all_dim_sizes, output)))
+            einsum_functions.append((name, emit_einsum_function(name, nodes, all_dim_sizes)))
             einsum_calls.append((name, operands.keys()))
         for op, dims in all_operand_dims.items():
             tensor_sizes[op] = 1
@@ -594,25 +529,62 @@ if __name__ == '__main__':
     #     ],
     #     512 * 1024
     # )
-    import time
-    start = time.time()
-    cb_full_tree(
-        [
-            Einsum(
-                {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
-                'C',
-                {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024}
-            ),
-            Einsum(
-                {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
-                'E',
-                {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024}
-            )
-        ],
-        512 * 1024
-    )
-    end = time.time()
-    print("Total time:", end - start)
+    # import time
+    # start = time.time()
+    # cb_full_tree(
+    #     [
+    #         Einsum(
+    #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C_spill': ('m', 'n')},
+    #             'C_spill',
+    #             {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024}
+    #         ),
+    #         Einsum(
+    #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
+    #             'E',
+    #             {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024}
+    #         )
+    #     ],
+    #     512 * 1024,
+    #     allow_spilling=True
+    # )
+    # cb_full_tree(
+    #     [
+    #         Einsum(
+    #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C_spill': ('m', 'n')},
+    #             'C_spill',
+    #             {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024}
+    #         ),
+    #         Einsum(
+    #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
+    #             'E',
+    #             {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024}
+    #         )
+    #     ],
+    #     32 * 1024 * 1024,
+    #     allow_spilling=True
+    # )
+    # end = time.time()
+    # print("Total time:", end - start)
+    # cb_full_tree(
+    #     [
+    #         Einsum(
+    #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
+    #             'C',
+    #             {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024}
+    #         )
+    #     ],
+    #     512 * 1024
+    # )
+    # cb_full_tree(
+    #     [
+    #         Einsum(
+    #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
+    #             'E',
+    #             {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024}
+    #         )
+    #     ],
+    #     512 * 1024
+    # )
     # cb_full_tree(
     #     [
     #         Einsum(
@@ -672,5 +644,96 @@ if __name__ == '__main__':
     #         )
     #     ],
     #     32 * 1024
+    # )
+    # cb_full_tree(
+    #     [
+    #         Einsum(
+    #             {'L0_X': ('m', 'd'), 'L0_WQ': ('d', 'k'), 'L0_Q_spill': ('m', 'k')}, 
+    #             'L0_Q_spill', 
+    #             {'m': 2048, 'd': 4096, 'k': 4096}
+    #         ),
+    #         Einsum(
+    #             {'L0_Q': ('m', 'k'), 'L0_K': ('n', 'k'), 'L0_S_spill': ('m', 'n')},
+    #             'L0_S_spill', 
+    #             {'m': 2048, 'n': 2048, 'k': 4096}
+    #         ), 
+    #         Einsum(
+    #             {'L0_S': ('m', 'n'), 'L0_V': ('n', 'k'), 'L0_O_spill': ('m', 'k')},
+    #             'L0_O_spill', 
+    #             {'m': 2048, 'n': 2048, 'k': 4096}
+    #         ), 
+    #         Einsum(
+    #             {'L0_O': ('m', 'k'), 'L0_Wo': ('k', 'd'), 'L0_Y': ('m', 'd')},
+    #             'L0_Y',
+    #             {'m': 2048, 'k': 4096, 'd': 4096}
+    #         ), 
+    #     ],
+    #     4 * 1024 * 1024,
+    #     allow_spilling=True
+    # )
+    cb_full_tree( #FULL SIX EINSUM GPT
+        [
+            Einsum(
+                {'L0_X': ('m', 'd'), 'L0_WQ': ('d', 'k'), 'L0_Q_spill': ('m', 'k')}, 
+                'L0_Q_spill', 
+                {'m': 2048, 'd': 4096, 'k': 4096}
+            ),
+            Einsum(
+                {'L0_Q': ('m', 'k'), 'L0_K': ('n', 'k'), 'L0_S_spill': ('m', 'n')},
+                'L0_S_spill', 
+                {'m': 2048, 'n': 2048, 'k': 4096}
+            ), 
+            Einsum(
+                {'L0_S': ('m', 'n'), 'L0_V': ('n', 'k1'), 'L0_O_spill': ('m', 'k1')},
+                'L0_O_spill', 
+                {'m': 2048, 'n': 2048, 'k1': 4096}
+            ), 
+            Einsum(
+                {'L0_O': ('m', 'k1'), 'L0_Wo': ('k1', 'd1'), 'L0_Y_spill': ('m', 'd1')},
+                'L0_Y_spill',
+                {'m': 2048, 'k1': 4096, 'd1': 4096}
+            ), 
+            Einsum(
+                {'L0_Y': ('m', 'd1'), 'L0_W1': ('d1', 'f1'), 'L0_H_spill': ('m', 'f1')},
+                'L0_H_spill',
+                {'m': 2048, 'd1': 4096, 'f1': 16384}
+            ),
+            Einsum(
+                {'L0_H': ('m', 'f1'), 'L0_W2': ('f1', 'd2'), 'L0_Z': ('m', 'd2')},
+                'L0_Z',
+                {'m': 2048, 'f1': 16384, 'd2': 4096}
+            )
+        ],
+        8 * 1024 * 1024,
+        allow_spilling=True
+    )
+    # def generate_matmul_chain(num_einsums, m, k_n_seq):
+    #     ret = []
+    #     dim_names = ('m', 'k', 'n0')
+    #     op_names = ('A', 'B0', 'C0')
+    #     for i in range(num_einsums):
+    #         sizes = (m, k_n_seq[i % len(k_n_seq)][0], k_n_seq[i % len(k_n_seq)][1])
+    #         dim_sizes = {dim_names[j]: sizes[j] for j in range(3)}
+    #         output_name = op_names[2]
+    #         if i < num_einsums - 1:
+    #             output_name = output_name + '_spill'
+    #         ret.append(Einsum(
+    #             {op_names[0]: (dim_names[0], dim_names[1]), op_names[1]: (dim_names[1], dim_names[2]), output_name: (dim_names[0], dim_names[2])}, 
+    #             output_name, 
+    #             dim_sizes
+    #         ))
+    #         dim_names = (dim_names[0], dim_names[2], 'n' + str(i+1))
+    #         op_names = (op_names[2], 'B' + str(i+1), 'C' + str(i+1))
+    #     return ret
+    # # print(generate_matmul_chain(2, 1024, [(4096, 4096)]))
+    # # print(generate_matmul_chain(2, 32*1024, [(4*1024, 16*1024), (16*1024, 4*1024)]))
+    # # cb_full_tree(
+    # #     generate_matmul_chain(2, 32*1024, [(4*1024, 16*1024), (16*1024, 4*1024)]),
+    # #     512 * 1024
+    # # )
+    # cb_full_tree(
+    #     generate_matmul_chain(4, 8*1024, [(16*1024, 16*1024), (16*1024, 4*1024), (4*1024, 4*1024), (4*1024, 16*1024)]),
+    #     512 * 1024,
+    #     allow_spilling=True
     # )
 
