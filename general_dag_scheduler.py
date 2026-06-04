@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 from ortools.sat.python import cp_model
 
@@ -15,13 +16,13 @@ def add_mul_chain(model:cp_model.CpModel, components, lb, ub, pfx):
 # tuple of coordinate names for outputs
 # dict mapping coordinate names to sizes
 
+@dataclass
 class Einsum:
-    def __init__(self, operand_dims, output_operand, dim_sizes):
-        self.operand_dims:Dict[str,Tuple[str]] = operand_dims
-        self.output_operand:str = output_operand
-        self.dim_sizes:Dict[str,int] = dim_sizes
-    def __repr__(self):
-        return f"Einsum({self.operand_dims}, {self.output_operand}, {self.dim_sizes})"
+    operand_dims: Dict[str, Tuple[str]]
+    output_operand: str
+    dim_sizes: Dict[str, int]
+    accel_gran: Dict[str, int] = None
+    compute_cost: int = 0
 
 
 def scheduler(
@@ -83,7 +84,7 @@ def scheduler(
                 if d not in all_dim_sizes:
                     all_dim_sizes[d] = e.dim_sizes[d]
             
-        new_e = Einsum(new_operand_dims, new_output, e.dim_sizes)
+        new_e = Einsum(new_operand_dims, new_output, e.dim_sizes, e.accel_gran, e.compute_cost)
         uniquified_einsums.append(new_e)
 
     all_operands = list(all_operand_dims.keys())
@@ -222,6 +223,30 @@ def scheduler(
                 continue
             model.AddBoolOr([totally_after[i][j], totally_after[j][i]]).OnlyEnforceIf(ancestor[i][j].Not(), ancestor[j][i].Not())
 
+    # Hierarchical timeline consistency: if P is a strict ancestor of Q, and Q is an ancestor of R,
+    # then P must have the identical temporal relationship with Q and R, preventing P from splitting a child subtree.
+    for p in all_operands:
+        for q in all_operands:
+            if p == q:
+                continue
+            
+            p_strict_anc_q = model.NewBoolVar(f'{p}_strict_anc_{q}')
+            model.AddBoolAnd([ancestor[p][q], ancestor[q][p].Not()]).OnlyEnforceIf(p_strict_anc_q)
+            model.AddBoolOr([ancestor[p][q].Not(), ancestor[q][p]]).OnlyEnforceIf(p_strict_anc_q.Not())
+
+            for r in all_operands:
+                if p == r or q == r:
+                    continue
+                
+                cond = model.NewBoolVar(f'cond_match_rel_{p}_{q}_{r}')
+                model.AddBoolAnd([p_strict_anc_q, ancestor[q][r]]).OnlyEnforceIf(cond)
+                model.AddBoolOr([p_strict_anc_q.Not(), ancestor[q][r].Not()]).OnlyEnforceIf(cond.Not())
+                
+                model.Add(totally_after[p][q] == totally_after[p][r]).OnlyEnforceIf(cond)
+                model.Add(totally_after[q][p] == totally_after[r][p]).OnlyEnforceIf(cond)
+                model.Add(contains[p][q] == contains[p][r]).OnlyEnforceIf(cond)
+
+
     # Einsum consistency: interval overlap for every pair of operands in the same Einsum
     for e in uniquified_einsums:
         for op1 in e.operand_dims.keys():
@@ -325,6 +350,7 @@ def scheduler(
     temporal_dim_contribs:Dict[str,Dict[str,Dict[str,cp_model.IntVar]]] = {}
     total_temporal_dim:Dict[str,Dict[str,cp_model.IntVar]] = {}
     total_temporal_cost:Dict[str,cp_model.IntVar] = {}
+    temporal_if_not_fused_cost:Dict[str,cp_model.IntVar] = {}
 
     # Total temporal dim calculation
     for op in all_operands:
@@ -368,7 +394,7 @@ def scheduler(
                 model.Add(total_size >= all_dim_sizes[d])
 
         total_temporal_cost[op] = model.NewIntVar(0, max_temporal_cost, 'total_temporal_cost_'+op)
-        temporal_if_not_fused_cost = add_mul_chain(
+        temporal_if_not_fused_cost[op] = add_mul_chain(
             model,
             list(total_temporal_dim[op].values()),
             1, max_temporal_cost,
@@ -376,10 +402,10 @@ def scheduler(
         )
         if op in must_write:
             model.Add(total_temporal_cost[op] == 0).OnlyEnforceIf(must_write[op].Not())
-            model.Add(total_temporal_cost[op] == temporal_if_not_fused_cost).OnlyEnforceIf(must_write[op])
+            model.Add(total_temporal_cost[op] == temporal_if_not_fused_cost[op]).OnlyEnforceIf(must_write[op])
         elif op in must_read:
             model.Add(total_temporal_cost[op] == 0).OnlyEnforceIf(must_read[op].Not())
-            model.Add(total_temporal_cost[op] == temporal_if_not_fused_cost).OnlyEnforceIf(must_read[op])
+            model.Add(total_temporal_cost[op] == temporal_if_not_fused_cost[op]).OnlyEnforceIf(must_read[op])
         else:
             assert False, "Internal error: all operands should be in either must_write or must_read"
 
@@ -401,6 +427,16 @@ def scheduler(
     
     # Optional optimality sanity constraints
     if enforce_optimal_placement:
+        max_useful_granularity = {}
+        for e in uniquified_einsums:
+            for d in e.dim_sizes.keys():
+                if d not in max_useful_granularity:
+                    max_useful_granularity[d] = 1
+                if e.accel_gran and e.compute_cost > 0:
+                    if d in e.accel_gran:
+                        max_useful_granularity[d] = max(max_useful_granularity[d], e.accel_gran[d])
+                    elif 'PRODUCT' in e.accel_gran:
+                        max_useful_granularity[d] = max(max_useful_granularity[d], e.accel_gran['PRODUCT'])
         for op in all_operands:
             for dim in op_allowed_temp_dims[op]:
                 # temporal factor is 1 if dim does not participate in this tensor or any same_node tensor (since if it did, we could just make this an inner loop and save the cost)
@@ -412,9 +448,9 @@ def scheduler(
                             if dim in all_operand_dims[other_op] and other_op != op
                         ])
                     )
-                # spatial factor is 1 if dim does participate in this and any descendants
+                # spatial factor is at most the maximum useful spatial granularity if dim does participate in this and any descendants
                 if dim in all_operand_dims[op]:
-                    model.Add(spatial_dim[op][dim] == 1).OnlyEnforceIf(
+                    model.Add(spatial_dim[op][dim] <= max_useful_granularity[dim]).OnlyEnforceIf(
                         *([
                             ancestor[op][other_op].Not()
                             for other_op in all_operands
@@ -422,7 +458,7 @@ def scheduler(
                         ])
                     )
 
-        # Ensure temporal_dim[C][dim] == 1 if C has at least one strict ancestor
+        # Ensure temporal_dim[C][dim] is at most the maximum useful spatial granularity if C has at least one strict ancestor
         # and dim participates in ALL strict ancestors of C.
         for c in all_operands:
             c_has_strict_anc = model.NewBoolVar(f'{c}_has_strict_anc')
@@ -447,7 +483,7 @@ def scheduler(
                     model.AddBoolOr([is_strict_anc[b] for b in bad_bs]).OnlyEnforceIf(bad_b_exists)
                     model.AddBoolAnd([is_strict_anc[b].Not() for b in bad_bs]).OnlyEnforceIf(bad_b_exists.Not())
                 
-                model.Add(temporal_dim[c][dim] == 1).OnlyEnforceIf([c_has_strict_anc, bad_b_exists.Not()])
+                model.Add(temporal_dim[c][dim] <= max_useful_granularity[dim]).OnlyEnforceIf([c_has_strict_anc, bad_b_exists.Not()])
 
         # No overlap and no strict ancestorship between op and any ops in einsums another version of op appears in
         for e in uniquified_einsums:
@@ -495,8 +531,63 @@ def scheduler(
                 
         model.Add(sum(active_costs) <= capacity)
 
+    # Compute cost
+    all_compute_iters = []
+    # for all einsums:
+    for i, e in enumerate(uniquified_einsums):
+        max_iterations = 1
+        for d in e.dim_sizes.keys():
+            max_iterations *= e.dim_sizes[d] * 2
+        # if it has a cost:
+        if e.compute_cost > 0:
+            # for each dim:
+            if len(e.accel_gran) == 1 and 'PRODUCT' in e.accel_gran:
+                # special case where only the product of the spatial dims matters. We can just multiply them together and then ceildiv by the granularity.
+                min_spatial_dims = []
+                for d in e.dim_sizes.keys():
+                    min_spatial_dim = model.NewIntVar(1, all_dim_sizes[d], f'min_spatial_{i}_{d}')
+                    spatial_dim_candidates = [spatial_dim[op][d] for op in e.operand_dims if d in all_operand_dims[op]]
+                    model.AddMinEquality(min_spatial_dim, spatial_dim_candidates)
+                    min_spatial_dims.append(min_spatial_dim)
+                spatial_dim_product = add_mul_chain(
+                    model,
+                    min_spatial_dims,
+                    1, capacity * len(e.dim_sizes), # upper bound on product of all spatial dims
+                    f'spatial_dim_product_{i}'
+                )
+                total_repetitions = model.NewIntVar(1, max_iterations // e.accel_gran['PRODUCT'] + 1, f'repetitions_{i}')
+                model.AddDivisionEquality(total_repetitions, spatial_dim_product + e.accel_gran['PRODUCT'] - 1, e.accel_gran['PRODUCT'])
+            else:
+                inner_loop_repetitions:List[cp_model.IntVar] = []
+                for d in e.accel_gran.keys():
+                    # find the smallest spatial value of each dim
+                    min_spatial_dim = model.NewIntVar(1, all_dim_sizes[d], f'min_spatial_{i}_{d}')
+                    spatial_dim_candidates = [spatial_dim[op][d] for op in e.operand_dims if d in all_operand_dims[op]]
+                    model.AddMinEquality(min_spatial_dim, spatial_dim_candidates)
+                    # ceildiv by granularity
+                    repetitions = model.NewIntVar(1, all_dim_sizes[d] // e.accel_gran[d] + 1, f'repetitions_{i}_{d}')
+                    tmp = model.NewIntVar(1, all_dim_sizes[d], f'tmp_{i}_{d}')
+                    model.Add(tmp == min_spatial_dim + e.accel_gran[d] - 1)
+                    model.AddDivisionEquality(repetitions, tmp, e.accel_gran[d])
+                    inner_loop_repetitions.append(repetitions)
+                # multiply all those
+                total_repetitions = add_mul_chain(
+                    model,
+                    inner_loop_repetitions,
+                    1, max_iterations,
+                    f'total_repetitions_{i}'
+                )
+            # multiply by max temporal cost of any operand (i.e. innermost operand temporal cost)
+            max_op_temporal_cost = model.NewIntVar(1, max_iterations, f'max_temporal_cost_{i}')
+            model.AddMaxEquality(max_op_temporal_cost, [temporal_if_not_fused_cost[op] for op in e.operand_dims.keys()])
+            total_compute_iters = model.NewIntVar(1, max_iterations, f'total_compute_iters_{i}')
+            model.AddMultiplicationEquality(total_compute_iters, [total_repetitions, max_op_temporal_cost])
+            all_compute_iters.append(total_compute_iters)
+        else:
+            all_compute_iters.append(0)
+
     # Objective: minimize total cost
-    model.Minimize(sum(total_cost_vars[op] for op in all_operands))
+    model.Minimize(sum([all_compute_iters[i] * uniquified_einsums[i].compute_cost for i in range(len(uniquified_einsums))]) + sum(total_cost_vars[op] for op in all_operands))
 
     if debug: print("MODEL WRITING DONE")
 
@@ -618,14 +709,14 @@ def scheduler(
                     if is_fused:
                         fused_producer = next((i for i in fused if op in fused[i] and solver.Value(fused[i][op])), None)
                         if fused_producer:
-                            print(f"{inner_indent}{op} = {fused_producer} # Fused alias")
+                            print(f"{inner_indent}{op} = {fused_producer} # Fused alias time {t}")
                         else:
-                            print(f"{inner_indent}{op} = zeros({shape_tuple}) # Fused root")
+                            print(f"{inner_indent}{op} = zeros({shape_tuple}) # Fused root time {t}")
                     else:
                         if "_read_" in op:
-                            print(f"{inner_indent}{op} = load({orig}, size={shape_tuple})")
+                            print(f"{inner_indent}{op} = load({orig}, size={shape_tuple}) # time {t}")
                         else:
-                            print(f"{inner_indent}{op} = zeros({shape_tuple})")
+                            print(f"{inner_indent}{op} = zeros({shape_tuple}) # time {t}")
                     
                     # Print any computations that trigger at this time
                     if t in compute_events:
@@ -645,7 +736,7 @@ def scheduler(
                     else:
                         if is_write:
                             print(f"{inner_indent}store({orig}) = {op}")
-                        print(f"{inner_indent}free({op})")
+                        print(f"{inner_indent}free({op}) # time {t}")
                 elif ev_type == 'child':
                     print_tree(item, child_indent, new_dim_counts)
                 
@@ -654,6 +745,13 @@ def scheduler(
         print("=============================\n")
     else:
         print(f"Solver did not find an optimal or feasible solution. Status: {status}")
+
+    print("COSTS:")
+    for i, e in enumerate(uniquified_einsums):
+        if e.compute_cost > 0:
+            print(f"Einsum {i} (compute cost {e.compute_cost}): {solver.Value(all_compute_iters[i])} iterations")
+    for op in all_operands:
+        print(f"Operand {op} (original name {original_names[op]}): total cost {solver.Value(total_cost_vars[op])} (spatial {solver.Value(spatial_cost[op])}, temporal {solver.Value(total_temporal_cost[op])})")
 
 if __name__ == '__main__':
     # scheduler(
@@ -669,12 +767,16 @@ if __name__ == '__main__':
     #         Einsum(
     #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
     #             'C',
-    #             {'m': 4 * 1024, 'k': 8 * 1024, 'n': 4 * 1024}
+    #             {'m': 4 * 1024, 'k': 8 * 1024, 'n': 4 * 1024},
+    #             accel_gran={'m': 32, 'n': 32},
+    #             compute_cost=100
     #         ),
     #         Einsum(
     #             {'C': ('m', 'n'), 'E': ('m', 'n')},
     #             'E',
-    #             {'m': 4 * 1024, 'n': 4 * 1024}
+    #             {'m': 4 * 1024, 'n': 4 * 1024},
+    #             accel_gran={'PRODUCT': 32 * 32},
+    #             compute_cost=100
     #         )
     #     ],
     #     512 * 1024,
@@ -686,14 +788,18 @@ if __name__ == '__main__':
             Einsum(
                 {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
                 'C',
-                {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024}
+                {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024},
+                accel_gran={'m': 32, 'n': 32},
+                compute_cost=32
             ),
             Einsum(
                 {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
                 'E',
-                {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024}
+                {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024},
+                accel_gran={'m': 32, 'l': 32},
+                compute_cost=32
             )
         ],
         32 * 1024 * 1024,
-        allow_spilling=True
+        allow_spilling=False
     )

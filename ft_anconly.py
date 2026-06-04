@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 from ortools.sat.python import cp_model
 from c_from_cpsat import emit_c_driver, emit_einsum_function, parse_indented_trace, extract_loops_and_operands
@@ -16,13 +17,11 @@ def add_mul_chain(model:cp_model.CpModel, components, lb, ub, pfx):
 # tuple of coordinate names for outputs
 # dict mapping coordinate names to sizes
 
+@dataclass
 class Einsum:
-    def __init__(self, operand_dims, output_operand, dim_sizes):
-        self.operand_dims:Dict[str,Tuple[str]] = operand_dims
-        self.output_operand:str = output_operand
-        self.dim_sizes:Dict[str,int] = dim_sizes
-    def __repr__(self):
-        return f"Einsum({self.operand_dims}, {self.output_operand}, {self.dim_sizes})"
+    operand_dims: Dict[str, Tuple[str]]
+    output_operand: str
+    dim_sizes: Dict[str, int]
 
 
 def cb_full_tree(
