@@ -30,8 +30,7 @@ def scheduler(
     capacity:int,
     enforce_optimal_placement = True,
     allow_spilling = False,
-    debug:bool = True,
-    force_order_A_B: Tuple[str, str] = None
+    debug:bool = True
 ):
     '''
     Solver program which synthesizes a schedule-tree / loop-tree structure for a DAG of einsums
@@ -493,21 +492,26 @@ def scheduler(
                     model.AddBoolOr(totally_after[op][op2], totally_after[op2][op])
                     model.Add(ancestor[op][op2] == ancestor[op2][op]) # same_node allowed, strict ancestorship not allowed
 
-    if force_order_A_B is not None:
-        a_orig, b_orig = force_order_A_B
-        if a_orig in operand_groups and b_orig in operand_groups:
-            a_unique = operand_groups[a_orig]["producer"]
-            if a_unique is not None:
-                b_uniques = operand_groups[b_orig]["consumers"]
-                a_dims = set(all_operand_dims[a_unique])
-                for b_unique in b_uniques:
-                    model.Add(totally_after[b_unique][a_unique] == 1)
-                    b_dims = set(all_operand_dims[b_unique])
-                    for dim in a_dims:
-                        if dim not in b_dims:
-                            for op in all_operands:
-                                if dim in op_allowed_temp_dims[op]:
-                                    model.Add(temporal_dim[op][dim] == 1).OnlyEnforceIf(ancestor[op][b_unique])
+    # Constraint for reinterpreted dimensions:
+    # For any two instances of the same original operand, if a dimension appears in one but not the other,
+    # it must have a temporal factor of 1 in any ancestor of the other instance.
+    for orig_name, group in operand_groups.items():
+        instances = []
+        if group["producer"] is not None:
+            instances.append(group["producer"])
+        instances.extend(group["consumers"])
+        
+        for u1 in instances:
+            for u2 in instances:
+                if u1 == u2:
+                    continue
+                dims1 = set(all_operand_dims[u1])
+                dims2 = set(all_operand_dims[u2])
+                
+                for dim in dims1 - dims2:
+                    for op in all_operands:
+                        if dim in op_allowed_temp_dims[op]:
+                            model.Add(temporal_dim[op][dim] == 1).OnlyEnforceIf(ancestor[op][u2])
 
     # Capacity constraint
     # At any point in time, the sum of spatial_cost of all active buffers must be <= capacity.

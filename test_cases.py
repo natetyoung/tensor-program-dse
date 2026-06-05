@@ -154,9 +154,9 @@ attention_block_einsums_breakq = [
         operand_dims={
             'X': ('b', 's', 'h'),
             'WQ': ('h', 'd'),
-            'Q0': ('b', 's', 'd'),
+            'Q': ('b', 's', 'd'),
         },
-        output_operand='Q0',
+        output_operand='Q',
         dim_sizes={'b': 4, 's': 256, 'h': 512, 'd': 64}
     ),
     Einsum(
@@ -179,7 +179,7 @@ attention_block_einsums_breakq = [
     ),
     Einsum(
         operand_dims={
-            'Q1': ('b', 's1', 'd'),
+            'Q': ('b', 's1', 'd'),
             'K': ('b', 's', 'd'),
             'S': ('b', 's1', 's'),
         },
@@ -217,4 +217,4 @@ if __name__ == '__main__':
     print("=========================================")
     print("Running Test Case 4: Attention Projection Block (break q)")
     print("=========================================")
-    scheduler(attention_block_einsums_breakq, capacity=16 * 1024, allow_spilling=True, force_order_A_B=('Q0', 'Q1'))
+    scheduler(attention_block_einsums_breakq, capacity=16 * 1024, allow_spilling=True)
