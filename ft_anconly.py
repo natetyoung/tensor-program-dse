@@ -286,6 +286,7 @@ def cb_full_tree(
                 total_size = model.NewIntVar(1, all_dim_sizes[d] * (2**len(all_operands)), 'total_dim_size_{op}_{d}')
                 model.AddMultiplicationEquality(total_size, [spatial_dim[op][d], total_temporal_dim[op][d]])
                 model.Add(total_size >= all_dim_sizes[d])
+                model.AddDivisionEquality(spatial_dim[op][d], all_dim_sizes[d] + total_temporal_dim[op][d] - 1, total_temporal_dim[op][d])
 
         if op in fused_operands or op.endswith('_spill'):
             total_temporal_cost[op] = model.NewIntVar(0, max_temporal_cost, 'total_temporal_cost_'+op)
@@ -382,6 +383,10 @@ def cb_full_tree(
             total_cost_vars[op],
             (spatial_cost[op], total_temporal_cost[op])
         )
+        if op in fused_operands or op.endswith('_spill'):
+            restore_op_name = op if op in fused_operands else op.replace('_spill', '')
+            model.Add(total_cost_vars[op] >= op_size).OnlyEnforceIf(fuse_op[restore_op_name].Not())
+            model.Add(total_cost_vars[op] == 0).OnlyEnforceIf(fuse_op[restore_op_name])
 
     model.Minimize(cp_model.LinearExpr.Sum(list(total_cost_vars.values())))
 

@@ -391,6 +391,7 @@ def scheduler(
                 total_size = model.NewIntVar(1, all_dim_sizes[d] * (2**len(all_operands)), 'total_dim_size_{op}_{d}')
                 model.AddMultiplicationEquality(total_size, [spatial_dim[op][d], total_temporal_dim[op][d]])
                 model.Add(total_size >= all_dim_sizes[d])
+                model.AddDivisionEquality(spatial_dim[op][d], all_dim_sizes[d] + total_temporal_dim[op][d] - 1, total_temporal_dim[op][d])
 
         total_temporal_cost[op] = model.NewIntVar(0, max_temporal_cost, 'total_temporal_cost_'+op)
         temporal_if_not_fused_cost[op] = add_mul_chain(
@@ -422,6 +423,13 @@ def scheduler(
             total_cost_vars[op],
             (spatial_cost[op], total_temporal_cost[op])
         )
+        # If an operand is not fused, its total cost must be at least its size
+        if op in must_write:
+            model.Add(total_cost_vars[op] >= op_size).OnlyEnforceIf(must_write[op])
+            model.Add(total_cost_vars[op] == 0).OnlyEnforceIf(must_write[op].Not())
+        elif op in must_read:
+            model.Add(total_cost_vars[op] >= op_size).OnlyEnforceIf(must_read[op])
+            model.Add(total_cost_vars[op] == 0).OnlyEnforceIf(must_read[op].Not())
 
     
     # Optional optimality sanity constraints
@@ -484,13 +492,25 @@ def scheduler(
                 
                 model.Add(temporal_dim[c][dim] <= max_useful_granularity[dim]).OnlyEnforceIf([c_has_strict_anc, bad_b_exists.Not()])
 
-        # No overlap and no strict ancestorship between op and any ops in einsums another version of op appears in
+        # No overlap and no strict ancestorship between different versions of the same operand
         for e in uniquified_einsums:
             for op in e.operand_dims.keys():
                 other_names = [op2 for op2 in all_operands if original_names[op2] == original_names[op] and op2 != op]
                 for op2 in other_names:
                     model.AddBoolOr(totally_after[op][op2], totally_after[op2][op])
                     model.Add(ancestor[op][op2] == ancestor[op2][op]) # same_node allowed, strict ancestorship not allowed
+        # If no fusion at all, no ancestorship between any operands in different einsums
+        for i in range(len(uniquified_einsums)):
+            for j in range(i+1, len(uniquified_einsums)):
+                e1 = uniquified_einsums[i]
+                e2 = uniquified_einsums[j]
+                for op1 in e1.operand_dims.keys():
+                    for op2 in e2.operand_dims.keys():
+                        model.AddBoolAnd([ancestor[op1][op2].Not(), ancestor[op2][op1].Not()]).OnlyEnforceIf(
+                            *([
+                                fused[op][consumer].Not() for op in fused for consumer in fused[op]
+                            ])
+                        )
 
     # Constraint for reinterpreted dimensions:
     # For any two instances of the same original operand, if a dimension appears in one but not the other,
