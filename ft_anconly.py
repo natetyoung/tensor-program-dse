@@ -204,6 +204,17 @@ def cb_full_tree(
             if other_op == op or other_op == op+'_spill':
                 continue
             model.Add(ancestor[other_op][op] == ancestor[other_op][op+'_spill']).OnlyEnforceIf(fuse_op[op])
+            # If they differ in ancestor_overlap, all temporal dims must be 1
+            for dim in op_allowed_temp_dims[op]:
+                model.Add(temporal_dim[op][dim] == 1).OnlyEnforceIf(
+                    fuse_op[op], ancestor_overlap[other_op][op], ancestor_overlap[other_op][op+'_spill'].Not())
+                model.Add(temporal_dim[op][dim] == 1).OnlyEnforceIf(
+                    fuse_op[op], ancestor_overlap[other_op][op].Not(), ancestor_overlap[other_op][op+'_spill'])
+            for dim in op_allowed_temp_dims[op+'_spill']:
+                model.Add(temporal_dim[op+'_spill'][dim] == 1).OnlyEnforceIf(
+                    fuse_op[op], ancestor_overlap[other_op][op], ancestor_overlap[other_op][op+'_spill'].Not())
+                model.Add(temporal_dim[op+'_spill'][dim] == 1).OnlyEnforceIf(
+                    fuse_op[op], ancestor_overlap[other_op][op].Not(), ancestor_overlap[other_op][op+'_spill'])
         # 3. They have exactly the same temporal dim factors if fused
         for dim in op_allowed_temp_dims[op]:
             if dim in op_allowed_temp_dims[op+'_spill']:
