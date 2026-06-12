@@ -22,6 +22,8 @@ class Einsum:
     operand_dims: Dict[str, Tuple[str]]
     output_operand: str
     dim_sizes: Dict[str, int]
+    accel_gran: Dict[str, int] = None
+    compute_cost: int = 0
 
 
 def cb_full_tree(
@@ -234,6 +236,7 @@ def cb_full_tree(
     temporal_dim_contribs:Dict[str,Dict[str,Dict[str,cp_model.IntVar]]] = {}
     total_temporal_dim:Dict[str,Dict[str,cp_model.IntVar]] = {}
     total_temporal_cost:Dict[str,cp_model.IntVar] = {}
+    temporal_if_not_fused_cost:Dict[str,cp_model.IntVar] = {}
     for op in all_operands:
         op_size = 1
         for d in all_operand_dims[op]:
@@ -288,24 +291,19 @@ def cb_full_tree(
                 model.Add(total_size >= all_dim_sizes[d])
                 model.AddDivisionEquality(spatial_dim[op][d], all_dim_sizes[d] + total_temporal_dim[op][d] - 1, total_temporal_dim[op][d])
 
+        temporal_if_not_fused_cost[op] = add_mul_chain(
+            model,
+            list(total_temporal_dim[op].values()),
+            1, max_temporal_cost,
+            'temporal_if_not_fused_'+op
+        )
         if op in fused_operands or op.endswith('_spill'):
             total_temporal_cost[op] = model.NewIntVar(0, max_temporal_cost, 'total_temporal_cost_'+op)
-            temporal_if_not_fused_cost = add_mul_chain(
-                model,
-                list(total_temporal_dim[op].values()),
-                1, max_temporal_cost,
-                'temporal_if_not_fused_'+op
-            )
             restore_op_name = op if op in fused_operands else op.replace('_spill', '')
             model.Add(total_temporal_cost[op] == 0).OnlyEnforceIf(fuse_op[restore_op_name])
-            model.Add(total_temporal_cost[op] == temporal_if_not_fused_cost).OnlyEnforceIf(fuse_op[restore_op_name].Not())
+            model.Add(total_temporal_cost[op] == temporal_if_not_fused_cost[op]).OnlyEnforceIf(fuse_op[restore_op_name].Not())
         else:
-            total_temporal_cost[op] = add_mul_chain(
-                model,
-                list(total_temporal_dim[op].values()),
-                1, max_temporal_cost,
-                'total_temporal_cost_'+op
-            )
+            total_temporal_cost[op] = temporal_if_not_fused_cost[op]
     
     # Capacity
     coexist_vars:Dict[str,Dict[str,cp_model.IntVar]] = {}
@@ -331,15 +329,26 @@ def cb_full_tree(
         model.Add(cp_model.LinearExpr.Sum(contrib_vars) + spatial_cost[op] <= capacity)
 
     if enforce_optimal_placement:
+        max_useful_granularity = {}
+        for e in einsums:
+            for d in e.dim_sizes.keys():
+                if d not in max_useful_granularity:
+                    max_useful_granularity[d] = 1
+                if e.accel_gran and e.compute_cost > 0:
+                    if d in e.accel_gran:
+                        max_useful_granularity[d] = max(max_useful_granularity[d], e.accel_gran[d])
+                    elif 'PRODUCT' in e.accel_gran:
+                        max_useful_granularity[d] = max(max_useful_granularity[d], e.accel_gran['PRODUCT'])
+
         # Optional optimality sanity constraints
         for op in all_operands:
             for dim in op_allowed_temp_dims[op]:
                 # temporal factor is 1 if dim does not participate in this tensor
                 if dim not in all_operand_dims[op]:
                     model.Add(temporal_dim[op][dim] == 1)
-                # spatial factor is 1 if dim does participate in this and any descendants
+                # spatial factor is at most the maximum useful spatial granularity if dim does participate in this and any descendants
                 if op not in fused_operands and dim in all_operand_dims[op]:
-                    model.Add(spatial_dim[op][dim] == 1).OnlyEnforceIf(
+                    model.Add(spatial_dim[op][dim] <= max_useful_granularity[dim]).OnlyEnforceIf(
                         *([
                             ancestor[op][other_op].Not()
                             for other_op in all_operands
@@ -388,7 +397,62 @@ def cb_full_tree(
             model.Add(total_cost_vars[op] >= op_size).OnlyEnforceIf(fuse_op[restore_op_name].Not())
             model.Add(total_cost_vars[op] == 0).OnlyEnforceIf(fuse_op[restore_op_name])
 
-    model.Minimize(cp_model.LinearExpr.Sum(list(total_cost_vars.values())))
+    # Compute cost
+    all_compute_iters = []
+    # for all einsums:
+    for i, e in enumerate(einsums):
+        max_iterations = 1
+        for d in e.dim_sizes.keys():
+            max_iterations *= e.dim_sizes[d] * 2
+        # if it has a cost:
+        if e.compute_cost > 0:
+            # for each dim:
+            if len(e.accel_gran) == 1 and 'PRODUCT' in e.accel_gran:
+                # special case where only the product of the spatial dims matters. We can just multiply them together and then ceildiv by the granularity.
+                min_spatial_dims = []
+                for d in e.dim_sizes.keys():
+                    min_spatial_dim = model.NewIntVar(1, all_dim_sizes[d], f'min_spatial_{i}_{d}')
+                    spatial_dim_candidates = [spatial_dim[op][d] for op in e.operand_dims if d in all_operand_dims[op]]
+                    model.AddMinEquality(min_spatial_dim, spatial_dim_candidates)
+                    min_spatial_dims.append(min_spatial_dim)
+                spatial_dim_product = add_mul_chain(
+                    model,
+                    min_spatial_dims,
+                    1, capacity * len(e.dim_sizes), # upper bound on product of all spatial dims
+                    f'spatial_dim_product_{i}'
+                )
+                total_repetitions = model.NewIntVar(1, max_iterations // e.accel_gran['PRODUCT'] + 1, f'repetitions_{i}')
+                model.AddDivisionEquality(total_repetitions, spatial_dim_product + e.accel_gran['PRODUCT'] - 1, e.accel_gran['PRODUCT'])
+            else:
+                inner_loop_repetitions:List[cp_model.IntVar] = []
+                for d in e.accel_gran.keys():
+                    # find the smallest spatial value of each dim
+                    min_spatial_dim = model.NewIntVar(1, all_dim_sizes[d], f'min_spatial_{i}_{d}')
+                    spatial_dim_candidates = [spatial_dim[op][d] for op in e.operand_dims if d in all_operand_dims[op]]
+                    model.AddMinEquality(min_spatial_dim, spatial_dim_candidates)
+                    # ceildiv by granularity
+                    repetitions = model.NewIntVar(1, all_dim_sizes[d] // e.accel_gran[d] + 1, f'repetitions_{i}_{d}')
+                    tmp = model.NewIntVar(1, all_dim_sizes[d], f'tmp_{i}_{d}')
+                    model.Add(tmp == min_spatial_dim + e.accel_gran[d] - 1)
+                    model.AddDivisionEquality(repetitions, tmp, e.accel_gran[d])
+                    inner_loop_repetitions.append(repetitions)
+                # multiply all those
+                total_repetitions = add_mul_chain(
+                    model,
+                    inner_loop_repetitions,
+                    1, max_iterations,
+                    f'total_repetitions_{i}'
+                )
+            # multiply by max temporal cost of any operand (i.e. innermost operand temporal cost)
+            max_op_temporal_cost = model.NewIntVar(1, max_iterations, f'max_temporal_cost_{i}')
+            model.AddMaxEquality(max_op_temporal_cost, [temporal_if_not_fused_cost[op] for op in e.operand_dims.keys()])
+            total_compute_iters = model.NewIntVar(1, max_iterations, f'total_compute_iters_{i}')
+            model.AddMultiplicationEquality(total_compute_iters, [total_repetitions, max_op_temporal_cost])
+            all_compute_iters.append(total_compute_iters)
+        else:
+            all_compute_iters.append(0)
+
+    model.Minimize(sum([all_compute_iters[i] * einsums[i].compute_cost for i in range(len(einsums))]) + cp_model.LinearExpr.Sum(list(total_cost_vars.values())))
 
     if debug: print("MODEL WRITING DONE")
 
@@ -497,6 +561,8 @@ def cb_full_tree(
         for e_num in range(len(einsums)):
             print(f"Einsum {e_num} spatial costs:", [(o, solver.Value(spatial_cost[o])) for o in einsums[e_num].operand_dims])
             print(f"Einsum {e_num} temporal costs:", [(o, solver.Value(total_temporal_cost[o])) for o in einsums[e_num].operand_dims])
+            if einsums[e_num].compute_cost > 0:
+                print(f"Einsum {e_num} compute iterations:", solver.Value(all_compute_iters[e_num]))
     
     if emit_c_code:
         einsum_functions = []
