@@ -23,6 +23,7 @@ class Einsum:
     dim_sizes: Dict[str, int]
     accel_gran: Dict[str, int] = None
     compute_cost: int = 0
+    operation: str = None
 
 
 def scheduler(
@@ -83,7 +84,7 @@ def scheduler(
                 if d not in all_dim_sizes:
                     all_dim_sizes[d] = e.dim_sizes[d]
             
-        new_e = Einsum(new_operand_dims, new_output, e.dim_sizes, e.accel_gran, e.compute_cost)
+        new_e = Einsum(new_operand_dims, new_output, e.dim_sizes, e.accel_gran, e.compute_cost, e.operation)
         uniquified_einsums.append(new_e)
 
     all_operands = list(all_operand_dims.keys())
@@ -536,11 +537,12 @@ def scheduler(
     # Capacity constraint
     # At any point in time, the sum of spatial_cost of all active buffers must be <= capacity.
     # Since all start and end times are distinct, peak memory must occur at some time_start[i].
+    active_costs = {}
     for i in all_operands:
-        active_costs = []
+        active_costs[i] = []
         for j in all_operands:
             if i == j:
-                active_costs.append(spatial_cost[i])
+                active_costs[i].append(spatial_cost[i])
             else:
                 is_active = model.NewBoolVar(f'active_at_start_{i}_{j}')
                 # Buffer j is active at time_start[i] iff j starts before i and j does not end before i starts.
@@ -551,9 +553,9 @@ def scheduler(
                 model.Add(active_cost_i_j == spatial_cost[j]).OnlyEnforceIf(is_active)
                 model.Add(active_cost_i_j == 0).OnlyEnforceIf(is_active.Not())
                 
-                active_costs.append(active_cost_i_j)
+                active_costs[i].append(active_cost_i_j)
                 
-        model.Add(sum(active_costs) <= capacity)
+        model.Add(sum(active_costs[i]) <= capacity)
 
     # Compute cost
     all_compute_iters = []
@@ -564,9 +566,14 @@ def scheduler(
             max_iterations *= e.dim_sizes[d] * 2
         # if it has a cost:
         if e.compute_cost > 0:
+            min_possible_total_iters = 1
             # for each dim:
             if len(e.accel_gran) == 1 and 'PRODUCT' in e.accel_gran:
                 # special case where only the product of the spatial dims matters. We can just multiply them together and then ceildiv by the granularity.
+                for d in e.dim_sizes.keys():
+                    min_possible_total_iters *= all_dim_sizes[d]
+                min_possible_total_iters = min_possible_total_iters // e.accel_gran['PRODUCT']
+
                 min_spatial_dims = []
                 for d in e.dim_sizes.keys():
                     min_spatial_dim = model.NewIntVar(1, all_dim_sizes[d], f'min_spatial_{i}_{d}')
@@ -582,6 +589,12 @@ def scheduler(
                 total_repetitions = model.NewIntVar(1, max_iterations // e.accel_gran['PRODUCT'] + 1, f'repetitions_{i}')
                 model.AddDivisionEquality(total_repetitions, spatial_dim_product + e.accel_gran['PRODUCT'] - 1, e.accel_gran['PRODUCT'])
             else:
+                for d in e.dim_sizes.keys():
+                    if d in e.accel_gran:
+                        min_possible_total_iters *= all_dim_sizes[d] // e.accel_gran[d]
+                    else:
+                        min_possible_total_iters *= all_dim_sizes[d]
+                
                 inner_loop_repetitions:List[cp_model.IntVar] = []
                 for d in e.accel_gran.keys():
                     # find the smallest spatial value of each dim
@@ -604,7 +617,7 @@ def scheduler(
             # multiply by max temporal cost of any operand (i.e. innermost operand temporal cost)
             max_op_temporal_cost = model.NewIntVar(1, max_iterations, f'max_temporal_cost_{i}')
             model.AddMaxEquality(max_op_temporal_cost, [temporal_if_not_fused_cost[op] for op in e.operand_dims.keys()])
-            total_compute_iters = model.NewIntVar(1, max_iterations, f'total_compute_iters_{i}')
+            total_compute_iters = model.NewIntVar(min_possible_total_iters, max_iterations, f'total_compute_iters_{i}')
             model.AddMultiplicationEquality(total_compute_iters, [total_repetitions, max_op_temporal_cost])
             all_compute_iters.append(total_compute_iters)
         else:
@@ -746,7 +759,8 @@ def scheduler(
                     if t in compute_events:
                         idx, write_op, ops = compute_events[t]
                         operands_str = ", ".join(ops)
-                        print(f"{inner_indent}{write_op} += compute_einsum_{idx}({operands_str})")
+                        op_type_str = f" [{uniquified_einsums[idx].operation}]" if uniquified_einsums[idx].operation else ""
+                        print(f"{inner_indent}{write_op} += compute_einsum_{idx}{op_type_str}({operands_str})")
                 
                 elif ev_type == 'free':
                     op = item
@@ -813,15 +827,17 @@ if __name__ == '__main__':
                 {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
                 'C',
                 {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024},
-                accel_gran={'m': 32, 'n': 32},
-                compute_cost=32
+                accel_gran={'m': 1, 'k': 128, 'n': 128},
+                compute_cost=100,
+                operation='matmul'
             ),
             Einsum(
                 {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
                 'E',
                 {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024},
-                accel_gran={'m': 32, 'l': 32},
-                compute_cost=32
+                accel_gran={'m': 1, 'n': 128, 'l': 128},
+                compute_cost=100,
+                operation='matmul'
             )
         ],
         32 * 1024 * 1024,

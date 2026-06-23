@@ -24,6 +24,7 @@ class Einsum:
     dim_sizes: Dict[str, int]
     accel_gran: Dict[str, int] = None
     compute_cost: int = 0
+    operation: str = None
 
 
 def cb_full_tree(
@@ -32,7 +33,8 @@ def cb_full_tree(
     enforce_optimal_placement = True,
     emit_c_code:bool = False,
     allow_spilling = False,
-    debug:bool = True
+    debug:bool = True,
+    return_fused:str = None
 ):
     '''
     Full schedule-tree model for a chain of einsums, for fusion at various levels.
@@ -583,6 +585,8 @@ def cb_full_tree(
         #print("tensor_sizes", tensor_sizes)
         return emit_c_driver(einsum_functions, tensor_sizes, einsum_calls)
 
+    if return_fused:
+        return solver.Value(fuse_op[return_fused])
     return solver.ObjectiveValue(), solver.ResponseProto().wall_time
         
 
