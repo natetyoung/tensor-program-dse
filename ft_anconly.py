@@ -1,30 +1,7 @@
-from dataclasses import dataclass
 from typing import Dict, List, Tuple
 from ortools.sat.python import cp_model
 from c_from_cpsat import emit_c_driver, emit_einsum_function, parse_indented_trace, extract_loops_and_operands
-
-def add_mul_chain(model:cp_model.CpModel, components, lb, ub, pfx):
-    old_var = components[0]
-    new_var = components[0]
-    for i in range(len(components) - 1):
-        old_var = new_var
-        new_var = model.NewIntVar(lb, ub, pfx+'_mul_chain'+str(i))
-        constr = model.AddMultiplicationEquality(new_var, (old_var, components[i+1]))
-    return new_var
-
-# Einsum description: 
-# dict mapping operand names to tuples of coordinate names for operands
-# tuple of coordinate names for outputs
-# dict mapping coordinate names to sizes
-
-@dataclass
-class Einsum:
-    operand_dims: Dict[str, Tuple[str]]
-    output_operand: str
-    dim_sizes: Dict[str, int]
-    accel_gran: Dict[str, int] = None
-    compute_cost: int = 0
-    operation: str = None
+from scheduler_utils import Einsum, add_mul_chain
 
 
 def cb_full_tree(
