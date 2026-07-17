@@ -158,6 +158,7 @@ class SchedulerModel:
     op_allowed_temp_dims: Dict[str, List]
     all_dim_sizes: Dict[str, int]
     capacity: int
+    num_cores: int
 
     # ── Tree-structure variables (_build_tree_structure) ──────────────────────
     # ancestor[i][j]: the node containing i is a (non-strict) ancestor of the node containing j
@@ -183,6 +184,8 @@ class SchedulerModel:
     spatial_dim: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
     # temporal_dim[op][dim]: loop-count factor introduced at op's node along dim
     temporal_dim: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
+    # parallel_dim[op][dim]: parallelization factor at op's node along dim (1 if not parallelized)
+    parallel_dim: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
 
     # ── Fusion variables (_build_fusion) ──────────────────────────────────────
     # must_write[op]: op must be written to off-chip memory
@@ -199,6 +202,10 @@ class SchedulerModel:
     temporal_dim_contribs: Dict[str, Dict[str, Dict[str, cp_model.IntVar]]] = field(default_factory=dict)
     # total_temporal_dim[op][dim]: product of all ancestors' temporal factors for op along dim
     total_temporal_dim: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
+    # parallel_dim_contribs[op][other_op][dim]: contribution of other_op's parallel factor to op's total
+    parallel_dim_contribs: Dict[str, Dict[str, Dict[str, cp_model.IntVar]]] = field(default_factory=dict)
+    # total_parallel_dim[op][dim]: product of all ancestors' parallel factors for op along dim
+    total_parallel_dim: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
     # temporal_if_not_fused_cost[op]: product of total_temporal_dim values for op (ignoring fusion)
     temporal_if_not_fused_cost: Dict[str, cp_model.IntVar] = field(default_factory=dict)
     # total_temporal_cost[op]: temporal_if_not_fused_cost[op] if op is not fused, else 0
@@ -397,6 +404,13 @@ def _build_factor_vars(sm: SchedulerModel) -> None:
         }
         for op in sm.all_operands
     }
+    sm.parallel_dim = {
+        op: {
+            dim: model.NewIntVar(1, min(sm.num_cores, sm.all_dim_sizes[dim]), f'{op}_par_{dim}')
+            for dim in sm.op_allowed_temp_dims[op]
+        }
+        for op in sm.all_operands
+    }
 
 
 def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
@@ -491,10 +505,10 @@ def _build_factor_constraints(sm: SchedulerModel) -> None:
     Add constraints on temporal_dim variables that reflect tree-structure rules.
 
     - If i is an ancestor of j and a dim in i's allowed temporal dims is NOT
-      in j's, then i's temporal factor for that dim must be 1 (it can't be
-      tiled at a level that j doesn't see).
-    - Non-anchor operands must have all temporal factors equal to 1 (only the
-      anchor's factors count for the node).
+      in j's, then i's temporal and parallel factors for that dim must be 1 
+      (we would introduce recompute for j's einsum otherwise).
+    - Non-anchor operands must have all temporal and parallel factors equal 
+      to 1 (only the anchor's factors count for the node).
     - Reinterpreted dimensions (a dimension present in one occurrence but not
       another of the same original operand) must have temporal factor 1 in any
       ancestor of the occurrence that lacks the dimension.
@@ -509,8 +523,10 @@ def _build_factor_constraints(sm: SchedulerModel) -> None:
             for dim in sm.op_allowed_temp_dims[i]:
                 if dim not in sm.op_allowed_temp_dims[j]:
                     model.Add(sm.temporal_dim[i][dim] == 1).OnlyEnforceIf(sm.ancestor[i][j])
+                    model.Add(sm.parallel_dim[i][dim] == 1).OnlyEnforceIf(sm.ancestor[i][j])
         for dim in sm.op_allowed_temp_dims[i]:
             model.Add(sm.temporal_dim[i][dim] == 1).OnlyEnforceIf(sm.is_anchor[i].Not())
+            model.Add(sm.parallel_dim[i][dim] == 1).OnlyEnforceIf(sm.is_anchor[i].Not())
 
     # Reinterpreted dimensions: if a dimension appears in one occurrence of an
     # original operand but not another, any ancestor of the occurrence that
@@ -531,6 +547,8 @@ def _build_factor_constraints(sm: SchedulerModel) -> None:
                     for op in ops:
                         if dim in sm.op_allowed_temp_dims[op]:
                             model.Add(sm.temporal_dim[op][dim] == 1).OnlyEnforceIf(
+                                sm.ancestor[op][u2])
+                            model.Add(sm.parallel_dim[op][dim] == 1).OnlyEnforceIf(
                                 sm.ancestor[op][u2])
 
 
@@ -589,9 +607,27 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
                     model.Add(contrib == 1).OnlyEnforceIf(sm.is_anchor[other_op].Not())
                 else:
                     model.Add(contrib == 1)
+        
+        # same for parallel_dim_contribs
+        sm.parallel_dim_contribs[op] = {}
+        for other_op in ops:
+            sm.parallel_dim_contribs[op][other_op] = {}
+            for d in sm.op_allowed_temp_dims[op]:
+                contrib = model.NewIntVar(1, min(sm.num_cores, sm.all_dim_sizes[d]),
+                                         f'par_contrib_{op}_{other_op}_{d}')
+                sm.parallel_dim_contribs[op][other_op][d] = contrib
+                if d in sm.parallel_dim[other_op]:
+                    model.Add(contrib == sm.parallel_dim[other_op][d]).OnlyEnforceIf(
+                        sm.ancestor[other_op][op], sm.is_anchor[other_op])
+                    model.Add(contrib == 1).OnlyEnforceIf(sm.ancestor[other_op][op].Not())
+                    model.Add(contrib == 1).OnlyEnforceIf(sm.is_anchor[other_op].Not())
+                else:
+                    model.Add(contrib == 1)
 
         # total_temporal_dim[op][d] = product of contributions over all operands
         sm.total_temporal_dim[op] = {}
+        # total_parallel_dim[op][d] same
+        sm.total_parallel_dim[op] = {}
         for d in sm.op_allowed_temp_dims[op]:
             sm.total_temporal_dim[op][d] = add_mul_chain(
                 model,
@@ -599,19 +635,40 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
                 1, sm.all_dim_sizes[d] * (2 ** len(ops)),
                 f'total_temporal_dim_{op}_{d}'
             )
-            # Dim fidelity: spatial[op][d] × total_temporal[op][d] ≥ dim_size[d]
-            # Equivalently: spatial[op][d] = ⌈dim_size[d] / total_temporal[op][d]⌉
+            sm.total_parallel_dim[op][d] = add_mul_chain(
+                model,
+                [sm.parallel_dim_contribs[op][other_op][d] for other_op in ops],
+                1, sm.num_cores,
+                f'total_parallel_dim_{op}_{d}'
+            )
+            # Dim fidelity: spatial[op][d] * total_temporal[op][d] * total_parallel[op][d] >= dim_size[d]
+            # Equivalently: spatial[op][d] = ceil(dim_size[d] / (total_temporal[op][d] * total_parallel[op][d]))
             if d in sm.all_operand_dims[op]:
                 total_size = model.NewIntVar(
                     1, sm.all_dim_sizes[d] * (2 ** len(ops)),
                     f'total_dim_size_{op}_{d}')
+                total_except_spatial = model.NewIntVar(
+                    1, sm.all_dim_sizes[d] * (2 ** len(ops)),
+                    f'total_except_spatial_{op}_{d}')
                 model.AddMultiplicationEquality(
-                    total_size, [sm.spatial_dim[op][d], sm.total_temporal_dim[op][d]])
+                    total_except_spatial, [sm.total_temporal_dim[op][d], sm.total_parallel_dim[op][d]])
+                model.AddMultiplicationEquality(
+                    total_size, [sm.spatial_dim[op][d], total_except_spatial])
                 model.Add(total_size >= sm.all_dim_sizes[d])
                 model.AddDivisionEquality(
                     sm.spatial_dim[op][d],
-                    sm.all_dim_sizes[d] + sm.total_temporal_dim[op][d] - 1,
-                    sm.total_temporal_dim[op][d])
+                    sm.all_dim_sizes[d] + total_except_spatial - 1,
+                    total_except_spatial)
+
+        # Constrain the product of all parallel factors along the path to this operand to be at most num_cores
+        path_parallel_dims = [sm.total_parallel_dim[op][d] for d in sm.op_allowed_temp_dims[op]]
+        total_path_parallel = add_mul_chain(
+            model,
+            path_parallel_dims,
+            1, sm.num_cores,
+            f'total_path_parallel_{op}'
+        )
+        model.Add(total_path_parallel <= sm.num_cores)
 
         # temporal_if_not_fused_cost = product of total_temporal_dim values
         sm.temporal_if_not_fused_cost[op] = add_mul_chain(
@@ -654,10 +711,10 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
         )
         # If an operand is not fused, its total cost must be at least its full size.
         if op in sm.must_write:
-            model.Add(sm.total_cost_vars[op] >= op_size).OnlyEnforceIf(sm.must_write[op])
+            model.Add(sm.total_cost_vars[op] >= op_size // sm.num_cores).OnlyEnforceIf(sm.must_write[op])
             model.Add(sm.total_cost_vars[op] == 0).OnlyEnforceIf(sm.must_write[op].Not())
         elif op in sm.must_read:
-            model.Add(sm.total_cost_vars[op] >= op_size).OnlyEnforceIf(sm.must_read[op])
+            model.Add(sm.total_cost_vars[op] >= op_size // sm.num_cores).OnlyEnforceIf(sm.must_read[op])
             model.Add(sm.total_cost_vars[op] == 0).OnlyEnforceIf(sm.must_read[op].Not())
 
 
@@ -895,7 +952,7 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
                 [sm.temporal_if_not_fused_cost[op] for op in e.operand_dims]
             )
             total_compute_iters = model.NewIntVar(
-                min_possible_total_iters, max_iterations, f'total_compute_iters_{i}')
+                min_possible_total_iters // sm.num_cores, max_iterations, f'total_compute_iters_{i}')
             model.AddMultiplicationEquality(
                 total_compute_iters, [total_repetitions, max_op_temporal])
             sm.all_compute_iters.append(total_compute_iters)
@@ -942,6 +999,10 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
             print(f"  Temporal factors: {{", end="")
             for d in sm.op_allowed_temp_dims[i]:
                 print(f"{d}: {solver.Value(sm.temporal_dim[i][d])}, ", end="")
+            print("}")
+            print(f"  Parallel factors: {{", end="")
+            for d in sm.op_allowed_temp_dims[i]:
+                print(f"{d}: {solver.Value(sm.parallel_dim[i][d])}, ", end="")
             print("}")
             if i in sm.must_write:
                 print(f"  Must write: {solver.Value(sm.must_write[i])}")
@@ -1016,9 +1077,16 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
             anchor = next(
                 (op for op in n if solver.Value(sm.is_anchor[op]) == 1), n[0])
 
-            # Emit for-loops for non-trivial temporal factors at this node
+            # Emit parallel loops / for-loops for non-trivial parallel and temporal factors at this node
+            parallel_str = []
             temporal_str = []
             new_dim_counts = dim_counts.copy()
+            for d in sm.op_allowed_temp_dims[anchor]:
+                val = solver.Value(sm.parallel_dim[anchor][d])
+                if val > 1:
+                    count = new_dim_counts.get(d, 0)
+                    parallel_str.append((f"{d}{count}", val))
+                    new_dim_counts[d] = count + 1
             for d in sm.op_allowed_temp_dims[anchor]:
                 val = solver.Value(sm.temporal_dim[anchor][d])
                 if val > 1:
@@ -1027,6 +1095,11 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
                     new_dim_counts[d] = count + 1
 
             inner_indent = indent
+            for loop_var, val in parallel_str:
+                print(f"{inner_indent}par {loop_var} in range({val}):")
+                inner_indent += "  "
+                indent_level += 1
+
             for loop_var, val in temporal_str:
                 print(f"{inner_indent}for {loop_var} in range({val}):")
                 inner_indent += "  "
@@ -1129,6 +1202,7 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
 def scheduler(
     einsums: List[Einsum],
     capacity: int,
+    num_cores: int = 1,
     enforce_optimal_placement: bool = True,
     allow_spilling: bool = False,
     debug: bool = True,
@@ -1182,6 +1256,7 @@ def scheduler(
         op_allowed_temp_dims=dag.op_allowed_temp_dims,
         all_dim_sizes=dag.all_dim_sizes,
         capacity=capacity,
+        num_cores=num_cores
     )
 
     # ── Step 3: Build model phases in dependency order ────────────────────────
