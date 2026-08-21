@@ -933,9 +933,7 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
                     model.AddMinEquality(min_sp, candidates)
                     repetitions = model.NewIntVar(
                         1, sm.all_dim_sizes[d] // e.accel_gran[d] + 1, f'repetitions_{i}_{d}')
-                    tmp = model.NewIntVar(1, sm.all_dim_sizes[d], f'tmp_{i}_{d}')
-                    model.Add(tmp == min_sp + e.accel_gran[d] - 1)
-                    model.AddDivisionEquality(repetitions, tmp, e.accel_gran[d])
+                    model.AddDivisionEquality(repetitions, min_sp + e.accel_gran[d] - 1, e.accel_gran[d])
                     inner_loop_repetitions.append(repetitions)
 
                 total_repetitions = add_mul_chain(
@@ -1325,7 +1323,7 @@ if __name__ == '__main__':
                 {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
                 'C',
                 {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024},
-                accel_gran={'m': 1, 'k': 128, 'n': 128},
+                accel_gran={'m': 512, 'k': 128, 'n': 128},
                 compute_cost=100,
                 operation='matmul'
             ),
@@ -1333,11 +1331,74 @@ if __name__ == '__main__':
                 {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
                 'E',
                 {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024},
-                accel_gran={'m': 1, 'n': 128, 'l': 128},
+                accel_gran={'m': 128, 'n': 128, 'l': 512},
                 compute_cost=100,
                 operation='matmul'
             )
         ],
-        32 * 1024 * 1024,
-        allow_spilling=False
+        7 * 1024 * 1024,
+        allow_spilling=True,
+        num_cores=2
     )
+    # scheduler(
+    #     [
+    #         Einsum(
+    #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
+    #             'C',
+    #             {'m': 64 * 1024, 'k': 128, 'n': 16 * 1024},
+    #             accel_gran={'m': 512, 'k': 128, 'n': 128},
+    #             compute_cost=100,
+    #             operation='matmul'
+    #         ),
+    #         Einsum(
+    #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
+    #             'E',
+    #             {'m': 64 * 1024, 'n': 16 * 1024, 'l': 4},
+    #             accel_gran={'m': 128, 'n': 128, 'l': 512},
+    #             compute_cost=100,
+    #             operation='matmul'
+    #         )
+    #     ],
+    #     6 * 1024 * 1024,
+    #     allow_spilling=True,
+    #     num_cores=1
+    # )
+    # scheduler(
+    #     [
+    #         Einsum(
+    #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
+    #             'C',
+    #             {'m': 165, 'k': 4, 'n': 90},
+    #             accel_gran={'m': 16},
+    #             compute_cost=1,
+    #             operation='matmul'
+    #         ),
+    #         Einsum(
+    #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
+    #             'E',
+    #             {'m': 165, 'n': 90, 'l': 16},
+    #             accel_gran={'l': 16},
+    #             compute_cost=1,
+    #             operation='matmul'
+    #         )
+    #     ],
+    #     512,
+    #     allow_spilling=True,
+    #     num_cores=1
+    # )
+    # scheduler(
+    #     [
+    #         Einsum(
+    #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
+    #             'C',
+    #             {'m': 16 * 1024, 'k': 1024, 'n': 4 * 1024}
+    #         ),
+    #         Einsum(
+    #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
+    #             'E',
+    #             {'m': 16 * 1024, 'n': 4 * 1024, 'l': 1024}
+    #         )
+    #     ],
+    #     8 * 1024 * 1024,
+    #     allow_spilling=True
+    # )

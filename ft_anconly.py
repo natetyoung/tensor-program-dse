@@ -411,9 +411,7 @@ def cb_full_tree(
                     model.AddMinEquality(min_spatial_dim, spatial_dim_candidates)
                     # ceildiv by granularity
                     repetitions = model.NewIntVar(1, all_dim_sizes[d] // e.accel_gran[d] + 1, f'repetitions_{i}_{d}')
-                    tmp = model.NewIntVar(1, all_dim_sizes[d], f'tmp_{i}_{d}')
-                    model.Add(tmp == min_spatial_dim + e.accel_gran[d] - 1)
-                    model.AddDivisionEquality(repetitions, tmp, e.accel_gran[d])
+                    model.AddDivisionEquality(repetitions, min_spatial_dim + e.accel_gran[d] - 1, e.accel_gran[d])
                     inner_loop_repetitions.append(repetitions)
                 # multiply all those
                 total_repetitions = add_mul_chain(
@@ -796,6 +794,22 @@ if __name__ == '__main__':
     # cb_full_tree(
     #     generate_matmul_chain(4, 8*1024, [(16*1024, 16*1024), (16*1024, 4*1024), (4*1024, 4*1024), (4*1024, 16*1024)]),
     #     512 * 1024,
+    #     allow_spilling=True
+    # )
+    # cb_full_tree(
+    #     [
+    #         Einsum(
+    #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C_spill': ('m', 'n')},
+    #             'C_spill',
+    #             {'m': 16 * 1024, 'k': 1024, 'n': 4 * 1024}
+    #         ),
+    #         Einsum(
+    #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
+    #             'E',
+    #             {'m': 16 * 1024, 'n': 4 * 1024, 'l': 1024}
+    #         )
+    #     ],
+    #     8 * 1024 * 1024,
     #     allow_spilling=True
     # )
 
