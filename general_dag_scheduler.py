@@ -551,6 +551,15 @@ def _build_factor_constraints(sm: SchedulerModel) -> None:
                             model.Add(sm.parallel_dim[op][dim] == 1).OnlyEnforceIf(
                                 sm.ancestor[op][u2])
 
+    # No reduction across cores: Operands which are einsum outputs should have no ancestors (strict or otherwise) 
+    # with a parallel factor in any dimension which is not in all_operand_dims for that operand.
+    einsum_outputs = [e.output_operand for e in sm.einsums]
+    for o in einsum_outputs:
+        for a in ops:
+            for dim in sm.op_allowed_temp_dims[a]:
+                if dim not in sm.all_operand_dims[o]:
+                    model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[a][o])
+                    model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[o][a])
 
 def _build_cost_vars(sm: SchedulerModel) -> None:
     """
