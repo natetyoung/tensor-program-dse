@@ -551,6 +551,16 @@ def _build_factor_constraints(sm: SchedulerModel) -> None:
                             model.Add(sm.parallel_dim[op][dim] == 1).OnlyEnforceIf(
                                 sm.ancestor[op][u2])
 
+    # Hierarchical spatial bounds: if i is an ancestor of j, then i's spatial tile
+    # must physically contain j's spatial tile for any shared dimension.
+    for i in ops:
+        for j in ops:
+            if i == j:
+                continue
+            for dim in sm.all_operand_dims[i]:
+                if dim in sm.all_operand_dims[j]:
+                    model.Add(sm.spatial_dim[i][dim] >= sm.spatial_dim[j][dim]).OnlyEnforceIf(sm.ancestor[i][j])
+
     # No reduction across cores: Operands which are einsum outputs should have no ancestors (strict or otherwise) 
     # with a parallel factor in any dimension which is not in all_operand_dims for that operand.
     einsum_outputs = [e.output_operand for e in sm.einsums]
