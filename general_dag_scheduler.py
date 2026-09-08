@@ -256,6 +256,7 @@ def _build_tree_structure(sm: SchedulerModel) -> None:
         for j in ops:
             if i == j:
                 model.Add(sm.same_node[i][j] == 1)
+                model.Add(sm.ancestor[i][j] == 1)
                 continue
             model.Add(sm.same_node[i][j] == 1).OnlyEnforceIf(sm.ancestor[i][j], sm.ancestor[j][i])
             model.Add(sm.same_node[i][j] == 0).OnlyEnforceIf(sm.ancestor[i][j].Not())
