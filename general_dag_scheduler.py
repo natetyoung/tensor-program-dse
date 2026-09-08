@@ -214,6 +214,8 @@ class SchedulerModel:
     total_cost_vars: Dict[str, cp_model.IntVar] = field(default_factory=dict)
     # all_compute_iters[i]: total compute iterations for uniquified einsum i (or 0 if no compute cost)
     all_compute_iters: List = field(default_factory=list)
+    final_compute_cost: Optional[cp_model.IntVar] = None
+    final_communication_cost: Optional[cp_model.IntVar] = None
 
 
 # ─── 3. Model-building helpers ────────────────────────────────────────────────
@@ -976,11 +978,40 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
         else:
             sm.all_compute_iters.append(0)
 
-    model.Minimize(
-        sum(sm.all_compute_iters[i] * sm.einsums[i].compute_cost
-            for i in range(len(sm.einsums)))
-        + sum(sm.total_cost_vars[op] for op in ops)
+    min_compute_cost = 0
+    max_compute_cost = 0
+    for i in range(len(sm.einsums)):
+        if sm.einsums[i].compute_cost == 0:
+            continue
+        else:
+            min_compute_cost += sm.einsums[i].compute_cost * sm.all_compute_iters[i].Proto().domain[0]
+            max_compute_cost += sm.einsums[i].compute_cost * sm.all_compute_iters[i].Proto().domain[1]
+
+    min_communication_cost = 0
+    max_communication_cost = 0
+    for op in ops:
+        min_communication_cost += sm.total_cost_vars[op].Proto().domain[0]
+        max_communication_cost += sm.total_cost_vars[op].Proto().domain[1]
+    
+    sm.final_compute_cost = model.NewIntVar(min_compute_cost, max_compute_cost, 'final_compute_cost')
+    model.Add(sm.final_compute_cost == sum(sm.all_compute_iters[i] * sm.einsums[i].compute_cost
+                                        for i in range(len(sm.einsums))))
+    sm.final_communication_cost = model.NewIntVar(min_communication_cost, max_communication_cost, 'final_communication_cost')
+    model.Add(sm.final_communication_cost == sum(sm.total_cost_vars[op] for op in ops))
+
+    final_cost = model.NewIntVar(
+        max(min_compute_cost, min_communication_cost),
+        max(max_compute_cost, max_communication_cost), 
+        'final_cost'
     )
+    model.Add(
+        final_cost >= sm.final_compute_cost
+    )
+    model.Add(
+        final_cost >= sm.final_communication_cost
+    )
+
+    model.Minimize(final_cost*5 + sm.final_compute_cost + sm.final_communication_cost)
 
 
 # ─── 4. Result extraction and printing ───────────────────────────────────────
@@ -1212,6 +1243,12 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
             f"(spatial {solver.Value(sm.spatial_cost[op])}, "
             f"temporal {solver.Value(sm.total_temporal_cost[op])})"
         )
+    if solver.Value(sm.final_compute_cost) > solver.Value(sm.final_communication_cost):
+        print(f"Final cost = {solver.Value(sm.final_compute_cost)} (compute dominated vs {solver.Value(sm.final_communication_cost)})")
+    elif solver.Value(sm.final_compute_cost) < solver.Value(sm.final_communication_cost):
+        print(f"Final cost = {solver.Value(sm.final_communication_cost)} (communication dominated vs {solver.Value(sm.final_compute_cost)})")
+    else:
+        print(f"Final cost = {solver.Value(sm.final_compute_cost)} (compute and communication equal)")
 
 
 # ─── 5. Orchestrator ─────────────────────────────────────────────────────────
@@ -1336,35 +1373,12 @@ if __name__ == '__main__':
     #     allow_spilling=True,
     #     debug=True
     # )
-    scheduler(
-        [
-            Einsum(
-                {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
-                'C',
-                {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024},
-                accel_gran={'m': 512, 'k': 128, 'n': 128},
-                compute_cost=100,
-                operation='matmul'
-            ),
-            Einsum(
-                {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
-                'E',
-                {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024},
-                accel_gran={'m': 128, 'n': 128, 'l': 512},
-                compute_cost=100,
-                operation='matmul'
-            )
-        ],
-        7 * 1024 * 1024,
-        allow_spilling=True,
-        num_cores=2
-    )
     # scheduler(
     #     [
     #         Einsum(
     #             {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
     #             'C',
-    #             {'m': 64 * 1024, 'k': 128, 'n': 16 * 1024},
+    #             {'m': 32 * 1024, 'k': 4 * 1024, 'n': 16 * 1024},
     #             accel_gran={'m': 512, 'k': 128, 'n': 128},
     #             compute_cost=100,
     #             operation='matmul'
@@ -1372,16 +1386,39 @@ if __name__ == '__main__':
     #         Einsum(
     #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
     #             'E',
-    #             {'m': 64 * 1024, 'n': 16 * 1024, 'l': 4},
+    #             {'m': 32 * 1024, 'n': 16 * 1024, 'l': 4 * 1024},
     #             accel_gran={'m': 128, 'n': 128, 'l': 512},
     #             compute_cost=100,
     #             operation='matmul'
     #         )
     #     ],
-    #     6 * 1024 * 1024,
+    #     7 * 1024 * 1024,
     #     allow_spilling=True,
-    #     num_cores=1
+    #     num_cores=2
     # )
+    scheduler(
+        [
+            Einsum(
+                {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')},
+                'C',
+                {'m': 64 * 1024, 'k': 128, 'n': 16 * 1024},
+                accel_gran={'m': 512, 'k': 128, 'n': 128},
+                compute_cost=70710,
+                operation='matmul'
+            ),
+            Einsum(
+                {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
+                'E',
+                {'m': 64 * 1024, 'n': 16 * 1024, 'l': 1},
+                accel_gran={'PRODUCT': 128},  #{'m': 128, 'n': 128, 'l': 512},
+                compute_cost=22,
+                operation='matmul'
+            )
+        ],
+        3 * 1024 * 1024,
+        allow_spilling=True,
+        num_cores=2
+    )
     # scheduler(
     #     [
     #         Einsum(
