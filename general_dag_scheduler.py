@@ -336,7 +336,7 @@ def _build_timeline(sm: SchedulerModel) -> None:
             # Producer must precede all readers of the same original operand
             if (sm.original_names[i] == sm.original_names[j]
                     and sm.operand_groups[sm.original_names[i]]["producer"] == i):
-                model.Add(sm.totally_after[j][i] == 1)
+                model.Add(sm.starts_after[j][i] == 1)
 
     # Tree-incomparable buffers must not overlap
     for i in ops:
@@ -423,7 +423,7 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
 
     An operand need not be transferred to/from memory if it is fused with an
     adjacent occurrence of the same original operand.  Fusion requires the two
-    occurrences to be in the same node and to have back-to-back time intervals.
+    occurrences to be in the same node and to have effectively-identical time intervals.
     Fused operands must share spatial factors along shared dimensions.
     """
     model = sm.model
@@ -438,13 +438,24 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
         for op in ops
         if sm.operand_groups[sm.original_names[op]]["producer"] != op
     }
+    all_names = {}
+    for op in sm.must_write:
+        orig = sm.original_names[op]
+        if orig not in all_names:
+            all_names[orig] = [op]
+    for op in sm.must_read:
+        orig = sm.original_names[op]
+        if orig not in all_names:
+            all_names[orig] = [op]
+        else:
+            all_names[orig].append(op)
+    # We do it this way to break symmetry on fusion (only one way needs to be expressible)
     sm.fused = {
-        op: {
-            consumer: model.NewBoolVar(f'fused_{op}_{consumer}')
-            for consumer in sm.operand_groups[sm.original_names[op]]["consumers"]
-            if consumer != op
+        names[i]: {
+            names[j]: model.NewBoolVar(f'fused_{names[i]}_{names[j]}')
+            for j in range(i + 1, len(names))
         }
-        for op in ops
+        for names in all_names.values() for i in range(len(names)) 
     }
 
     for op in ops:
@@ -462,9 +473,9 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
                 model.AddBoolOr(
                     [sm.must_read[consumer] for consumer in consumers]
                 ).OnlyEnforceIf(sm.must_write[op])
-                # Consumers are sequenced after the producer
+                # Consumers which must read are sequenced after the producer
                 for consumer in consumers:
-                    model.Add(sm.totally_after[consumer][op] == 1)
+                    model.Add(sm.totally_after[consumer][op] == 1).OnlyEnforceIf(sm.must_read[consumer])
 
         if op in sm.must_read:
             possibly_fused_predecessors = [i for i in sm.fused if op in sm.fused[i]]
@@ -479,17 +490,32 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
                 [sm.fused[i][op].Not() for i in sm.fused if op in sm.fused[i]]
             ).OnlyEnforceIf(sm.must_read[op])
 
-        # Fusion definition: same node and back-to-back intervals.
+        # Fusion happens in chains, not trees: only one fusion partner in each direction
+        for i1 in sm.fused:
+            model.AddAtMostOne([
+                sm.fused[i1][consumer] for consumer in sm.fused[i1]
+            ])
+        for i2 in ops:
+            model.AddAtMostOne([
+                sm.fused[i1][i2] for i1 in sm.fused if i2 in sm.fused[i1]
+            ])
+
+        # Fusion definition: same node and as-close-to-identical-as-possible intervals.
         # Consistent spatial factors along shared dimensions enforced for efficiency
-        for consumer in consumers:
+        for consumer in sm.fused[op] if op in sm.fused else []:
             if consumer == op:
                 continue
-            model.Add(sm.time_end[op] + 1 == sm.time_start[consumer]).OnlyEnforceIf(
+            model.Add(sm.time_start[op] + 1 == sm.time_start[consumer]).OnlyEnforceIf(
+                sm.fused[op][consumer])
+            model.Add(sm.time_end[op] + 1 == sm.time_end[consumer]).OnlyEnforceIf(
                 sm.fused[op][consumer])
             model.Add(sm.same_node[op][consumer] == 1).OnlyEnforceIf(
                 sm.fused[op][consumer])
             # If not fused, the intervals must be fully separated.
-            model.AddBoolOr(sm.totally_after[op][consumer], sm.totally_after[consumer][op])
+            if op in sm.fused[consumer]:
+                model.AddBoolOr(sm.totally_after[op][consumer], sm.totally_after[consumer][op]).OnlyEnforceIf(sm.fused[op][consumer].Not(), sm.fused[consumer][op].Not())
+            else:
+                model.AddBoolOr(sm.totally_after[op][consumer], sm.totally_after[consumer][op]).OnlyEnforceIf(sm.fused[op][consumer].Not())
             # Spatial factors must agree along any shared dimension.
             for dim in sm.all_operand_dims[op]:
                 if dim in sm.spatial_dim[consumer]:
@@ -752,8 +778,8 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
       granularity for that dimension across all einsums.
     - Temporal factors are similarly bounded when all strict ancestors of an
       operand share that dimension.
-    - Different occurrences of the same original operand must not overlap in
-      time and must not be strict ancestors of each other.
+    - Different occurrences of the same original operand must not be strict 
+      ancestors of each other.
     - When there is no fusion at all, operands belonging to different einsums 
       must not be in an ancestor relationship.
     """
@@ -824,14 +850,13 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
                 sm.temporal_dim[c][dim] <= max_useful_granularity[dim]
             ).OnlyEnforceIf([c_has_strict_anc, bad_b_exists.Not()])
 
-    # No overlap and no strict ancestorship between different occurrences of the
+    # No strict ancestorship between different occurrences of the
     # same original operand.
     for e in sm.einsums:
         for op in e.operand_dims:
             other_names = [op2 for op2 in ops
                         if sm.original_names[op2] == sm.original_names[op] and op2 != op]
             for op2 in other_names:
-                model.AddBoolOr(sm.totally_after[op][op2], sm.totally_after[op2][op])
                 # same_node is allowed; strict ancestorship is not
                 model.Add(sm.ancestor[op][op2] == sm.ancestor[op2][op])
 
@@ -870,7 +895,13 @@ def _build_capacity_constraint(sm: SchedulerModel) -> None:
         active_costs = []
         for j in ops:
             if i == j:
-                active_costs.append(sm.spatial_cost[i])
+                if i in sm.must_read:
+                    self_active_cost = model.NewIntVar(0, sm.capacity, f'active_cost_{i}_{j}')
+                    model.Add(self_active_cost == sm.spatial_cost[i]).OnlyEnforceIf(sm.must_read[i])
+                    model.Add(self_active_cost == 0).OnlyEnforceIf(sm.must_read[i].Not())
+                    active_costs.append(self_active_cost)
+                else:
+                    active_costs.append(sm.spatial_cost[i])
             else:
                 is_active = model.NewBoolVar(f'active_at_start_{i}_{j}')
                 model.AddBoolAnd(
@@ -881,8 +912,14 @@ def _build_capacity_constraint(sm: SchedulerModel) -> None:
                 ).OnlyEnforceIf(is_active.Not())
 
                 active_cost_ij = model.NewIntVar(0, sm.capacity, f'active_cost_{i}_{j}')
-                model.Add(active_cost_ij == sm.spatial_cost[j]).OnlyEnforceIf(is_active)
-                model.Add(active_cost_ij == 0).OnlyEnforceIf(is_active.Not())
+                # if j in must_read, only actually active if must read
+                if j in sm.must_read:
+                    model.Add(active_cost_ij == sm.spatial_cost[j]).OnlyEnforceIf(is_active, sm.must_read[j])
+                    model.Add(active_cost_ij == 0).OnlyEnforceIf(is_active.Not())
+                    model.Add(active_cost_ij == 0).OnlyEnforceIf(sm.must_read[j].Not())
+                else:
+                    model.Add(active_cost_ij == sm.spatial_cost[j]).OnlyEnforceIf(is_active)
+                    model.Add(active_cost_ij == 0).OnlyEnforceIf(is_active.Not())
                 active_costs.append(active_cost_ij)
 
         model.Add(sum(active_costs) <= sm.capacity)
@@ -1454,6 +1491,42 @@ if __name__ == '__main__':
     #             {'C': ('m', 'n'), 'D': ('n', 'l'), 'E': ('m', 'l')},
     #             'E',
     #             {'m': 16 * 1024, 'n': 4 * 1024, 'l': 1024}
+    #         )
+    #     ],
+    #     8 * 1024 * 1024,
+    #     allow_spilling=True
+    # )
+    # scheduler( #FULL SIX EINSUM GPT
+    #     [
+    #         Einsum(
+    #             {'L0_X': ('m', 'd'), 'L0_WQ': ('d', 'k'), 'L0_Q_spill': ('m', 'k')}, 
+    #             'L0_Q_spill', 
+    #             {'m': 2048, 'd': 4096, 'k': 4096}
+    #         ),
+    #         Einsum(
+    #             {'L0_Q': ('m', 'k'), 'L0_K': ('n', 'k'), 'L0_S_spill': ('m', 'n')},
+    #             'L0_S_spill', 
+    #             {'m': 2048, 'n': 2048, 'k': 4096}
+    #         ), 
+    #         Einsum(
+    #             {'L0_S': ('m', 'n'), 'L0_V': ('n', 'k1'), 'L0_O_spill': ('m', 'k1')},
+    #             'L0_O_spill', 
+    #             {'m': 2048, 'n': 2048, 'k1': 4096}
+    #         ), 
+    #         Einsum(
+    #             {'L0_O': ('m', 'k1'), 'L0_Wo': ('k1', 'd1'), 'L0_Y_spill': ('m', 'd1')},
+    #             'L0_Y_spill',
+    #             {'m': 2048, 'k1': 4096, 'd1': 4096}
+    #         ), 
+    #         Einsum(
+    #             {'L0_Y': ('m', 'd1'), 'L0_W1': ('d1', 'f1'), 'L0_H_spill': ('m', 'f1')},
+    #             'L0_H_spill',
+    #             {'m': 2048, 'd1': 4096, 'f1': 16384}
+    #         ),
+    #         Einsum(
+    #             {'L0_H': ('m', 'f1'), 'L0_W2': ('f1', 'd2'), 'L0_Z': ('m', 'd2')},
+    #             'L0_Z',
+    #             {'m': 2048, 'f1': 16384, 'd2': 4096}
     #         )
     #     ],
     #     8 * 1024 * 1024,
