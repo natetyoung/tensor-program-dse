@@ -169,16 +169,19 @@ class SchedulerModel:
     is_anchor: Dict[str, cp_model.IntVar] = field(default_factory=dict)
 
     # ── Timeline variables (_build_timeline) ──────────────────────────────────
-    # time_start[i] / time_end[i]: unique integer timestamps for buffer lifetime of i
+    # Time is measured in einsum steps: each einsum executes at one step, and
+    # buffers are allocated/freed in the gaps between steps.
+    # pos[k]: step at which einsum k executes (a permutation of [0, E))
+    pos: List[cp_model.IntVar] = field(default_factory=list)
+    # time_start[i] / time_end[i]: first / last step (inclusive) at which buffer i is live
     time_start: Dict[str, cp_model.IntVar] = field(default_factory=dict)
     time_end: Dict[str, cp_model.IntVar] = field(default_factory=dict)
-    # win_start[x] / win_end[x]: time window enclosing every buffer in the subtree rooted at x's node
+    # win_start[x] / win_end[x]: step range enclosing every buffer in the subtree rooted at x's node
     win_start: Dict[str, cp_model.IntVar] = field(default_factory=dict)
     win_end: Dict[str, cp_model.IntVar] = field(default_factory=dict)
-    # totally_after[i][j]: time interval for i is entirely after that of j
+    # totally_after[i][j]: (half-reified) buffer i is live only at steps after buffer j is freed.
+    # Only defined for pairs of occurrences of the same original operand.
     totally_after: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
-    # starts_after[i][j]: time interval for i starts after that of j
-    starts_after: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
 
     # ── Factor variables (_build_factor_vars) ─────────────────────────────────
     # spatial_dim[op][dim]: spatial tiling factor for operand op along dim
@@ -273,64 +276,67 @@ def _build_tree_structure(sm: SchedulerModel) -> None:
 
 def _build_timeline(sm: SchedulerModel) -> None:
     """
-    Create per-operand start/end time variables, per-operand subtree windows,
-    and the interval-relationship auxiliary booleans (totally_after,
-    starts_after).
+    Create the einsum step order, per-operand live ranges, per-operand subtree
+    windows, and the totally_after auxiliary booleans.
+
+    Time is measured in einsum steps: pos[k] is a permutation of [0, E), and
+    each buffer i is live over the inclusive step range
+    [time_start[i], time_end[i]].  Buffers are allocated and freed in the gaps
+    between steps, so two ranges overlap iff they share a step.
 
     Constraints enforce:
-    - start < end for every operand
-    - all start/end timestamps are globally distinct (total order)
-    - x's window [win_start[x], win_end[x]] encloses the interval of every
-      buffer in the subtree rooted at x's node
-    - if p is a strict ancestor of x, p's interval either encloses x's whole
+    - every buffer is live at its own einsum's step (so all operands of an
+      einsum overlap)
+    - every producer einsum executes before each of its consumer einsums
+    - x's window [win_start[x], win_end[x]] encloses the range of every
+      buffer in the subtree rooted at x's node; same-node operands share a
+      window
+    - if p is a strict ancestor of x, p's range either encloses x's whole
       window or is completely separate from it (no subtree-splitting)
     - windows of incomparable operands (neither is ancestor of the other) never
-      overlap, so each subtree occupies one contiguous block of time
-    - all operands of the same einsum overlap in time
-    - if i is the unique producer of an original operand, every reader of that
-      operand starts after i
+      overlap, so each subtree occupies one contiguous block of steps
+    - an einsum's step lies outside the window of any subtree that contains
+      none of its operands (it cannot execute inside another subtree's loops)
+    - all operands of the same einsum are comparable in the tree
     """
     model = sm.model
     ops = sm.all_operands
-    N = len(ops)
+    E = len(sm.einsums)
+    op_einsum = {op: k for k, e in enumerate(sm.einsums) for op in e.operand_dims}
 
-    sm.time_start = {i: model.NewIntVar(0, 2*N - 1, f'{i}_start') for i in ops}
-    sm.time_end   = {i: model.NewIntVar(0, 2*N - 1, f'{i}_end')   for i in ops}
-    sm.win_start  = {x: model.NewIntVar(0, 2*N - 1, f'{x}_win_start') for x in ops}
-    sm.win_end    = {x: model.NewIntVar(0, 2*N - 1, f'{x}_win_end')   for x in ops}
+    sm.pos = [model.NewIntVar(0, E - 1, f'einsum_{k}_pos') for k in range(E)]
+    model.AddAllDifferent(sm.pos)
 
+    # Producers execute before consumers
+    for group in sm.operand_groups.values():
+        if group["producer"] is None:
+            continue
+        for consumer in group["consumers"]:
+            model.Add(sm.pos[op_einsum[group["producer"]]] < sm.pos[op_einsum[consumer]])
+
+    sm.time_start = {i: model.NewIntVar(0, E - 1, f'{i}_start') for i in ops}
+    sm.time_end   = {i: model.NewIntVar(0, E - 1, f'{i}_end')   for i in ops}
+    sm.win_start  = {x: model.NewIntVar(0, E - 1, f'{x}_win_start') for x in ops}
+    sm.win_end    = {x: model.NewIntVar(0, E - 1, f'{x}_win_end')   for x in ops}
+
+    # Each buffer is live at its own einsum's step
     for i in ops:
-        model.Add(sm.time_start[i] < sm.time_end[i])
+        model.Add(sm.time_start[i] <= sm.pos[op_einsum[i]])
+        model.Add(sm.pos[op_einsum[i]] <= sm.time_end[i])
 
-    model.AddAllDifferent(
-        [sm.time_start[i] for i in ops] + [sm.time_end[i] for i in ops])
-
-    sm.totally_after = {i: {j: model.NewBoolVar(f'{i}_totally_after_{j}') for j in ops if i != j} for i in ops}
-    sm.starts_after  = {i: {j: model.NewBoolVar(f'{i}_starts_after_{j}')  for j in ops if i != j} for i in ops}
-
+    # totally_after is only needed between occurrences of the same original
+    # operand (fusion / spilling), and only in the positive direction.
+    sm.totally_after = {
+        i: {j: model.NewBoolVar(f'{i}_totally_after_{j}')
+            for j in ops if i != j and sm.original_names[i] == sm.original_names[j]}
+        for i in ops
+    }
     for i in ops:
-        for j in ops:
-            if i == j:
-                continue
-
-            # Define starts_after via time comparisons
-            model.Add(sm.time_start[i] > sm.time_start[j]).OnlyEnforceIf(sm.starts_after[i][j])
-            model.Add(sm.time_start[i] < sm.time_start[j]).OnlyEnforceIf(sm.starts_after[i][j].Not())
-            model.Add(sm.starts_after[i][j] == sm.starts_after[j][i].Not())
-
-            # Define totally_after
-            model.Add(sm.time_start[i] > sm.time_end[j]).OnlyEnforceIf(sm.totally_after[i][j])
-            model.Add(sm.time_start[i] < sm.time_end[j]).OnlyEnforceIf(sm.totally_after[i][j].Not())
-
-            # Producer must precede all readers of the same original operand
-            if (sm.original_names[i] == sm.original_names[j]
-                    and sm.operand_groups[sm.original_names[i]]["producer"] == i):
-                model.Add(sm.starts_after[j][i] == 1)
+        for j, lit in sm.totally_after[i].items():
+            model.Add(sm.time_start[i] > sm.time_end[j]).OnlyEnforceIf(lit)
 
     # Subtree windows.  Windows need only be outer bounds: a loose window can
     # only force ancestors to live longer, so the solver prefers tight ones.
-    # Non-strict inequalities suffice below because every window bound is
-    # compared against distinct buffer timestamps.
     for x in ops:
         for y in ops:
             # x's window encloses every buffer in x's subtree (including x)
@@ -354,32 +360,44 @@ def _build_timeline(sm: SchedulerModel) -> None:
             p_after    = model.NewBoolVar(f'{p}_after_win_{x}')
             model.Add(sm.time_start[p] <= sm.win_start[x]).OnlyEnforceIf(p_encloses)
             model.Add(sm.win_end[x] <= sm.time_end[p]).OnlyEnforceIf(p_encloses)
-            model.Add(sm.time_end[p] <= sm.win_start[x]).OnlyEnforceIf(p_before)
-            model.Add(sm.win_end[x] <= sm.time_start[p]).OnlyEnforceIf(p_after)
+            model.Add(sm.time_end[p] < sm.win_start[x]).OnlyEnforceIf(p_before)
+            model.Add(sm.win_end[x] < sm.time_start[p]).OnlyEnforceIf(p_after)
             model.AddBoolOr([p_encloses, p_before, p_after]).OnlyEnforceIf(
                 sm.ancestor[p][x], sm.ancestor[x][p].Not())
 
     for idx, x in enumerate(ops):
         for z in ops[idx + 1:]:
             # Incomparable subtrees occupy disjoint windows.  Since each
-            # buffer's interval lies within its own window, this also keeps
+            # buffer's range lies within its own window, this also keeps
             # incomparable buffers from overlapping.
             x_first = model.NewBoolVar(f'win_{x}_before_win_{z}')
             z_first = model.NewBoolVar(f'win_{z}_before_win_{x}')
-            model.Add(sm.win_end[x] <= sm.win_start[z]).OnlyEnforceIf(x_first)
-            model.Add(sm.win_end[z] <= sm.win_start[x]).OnlyEnforceIf(z_first)
+            model.Add(sm.win_end[x] < sm.win_start[z]).OnlyEnforceIf(x_first)
+            model.Add(sm.win_end[z] < sm.win_start[x]).OnlyEnforceIf(z_first)
             model.AddBoolOr([x_first, z_first]).OnlyEnforceIf(
                 sm.ancestor[x][z].Not(), sm.ancestor[z][x].Not())
 
-    # All operands in the same einsum must have overlapping lifetimes and be
-    # comparable in the tree (one must be an ancestor of the other).
+    # An einsum executes outside the window of any subtree containing none of
+    # its operands.  (If x is an ancestor of any operand of k, it is an
+    # ancestor of k's deepest operand, since k's operands form a chain.)
+    for x in ops:
+        for k, e in enumerate(sm.einsums):
+            if x in e.operand_dims:
+                continue
+            k_before = model.NewBoolVar(f'einsum_{k}_before_win_{x}')
+            k_after  = model.NewBoolVar(f'einsum_{k}_after_win_{x}')
+            model.Add(sm.pos[k] < sm.win_start[x]).OnlyEnforceIf(k_before)
+            model.Add(sm.win_end[x] < sm.pos[k]).OnlyEnforceIf(k_after)
+            model.AddBoolOr(
+                [sm.ancestor[x][o] for o in e.operand_dims] + [k_before, k_after])
+
+    # All operands in the same einsum must be comparable in the tree (one must
+    # be an ancestor of the other).
     for e in sm.einsums:
         for op1 in e.operand_dims:
             for op2 in e.operand_dims:
                 if op1 == op2:
                     continue
-                model.Add(sm.time_start[op1] < sm.time_end[op2])
-                model.Add(sm.time_start[op2] < sm.time_end[op1])
                 model.AddBoolOr(sm.ancestor[op1][op2], sm.ancestor[op2][op1])
 
 
@@ -502,14 +520,15 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
                 sm.fused[i1][i2] for i1 in sm.fused if i2 in sm.fused[i1]
             ])
 
-        # Fusion definition: same node and as-close-to-identical-as-possible intervals.
+        # Fusion definition: same node and identical live ranges (so the shared
+        # buffer is live at both einsums' steps).
         # Consistent spatial factors along shared dimensions enforced for efficiency
         for consumer in sm.fused[op] if op in sm.fused else []:
             if consumer == op:
                 continue
-            model.Add(sm.time_start[op] + 1 == sm.time_start[consumer]).OnlyEnforceIf(
+            model.Add(sm.time_start[op] == sm.time_start[consumer]).OnlyEnforceIf(
                 sm.fused[op][consumer])
-            model.Add(sm.time_end[op] + 1 == sm.time_end[consumer]).OnlyEnforceIf(
+            model.Add(sm.time_end[op] == sm.time_end[consumer]).OnlyEnforceIf(
                 sm.fused[op][consumer])
             model.Add(sm.same_node[op][consumer] == 1).OnlyEnforceIf(
                 sm.fused[op][consumer])
@@ -884,45 +903,40 @@ def _build_capacity_constraint(sm: SchedulerModel) -> None:
     At any point in time the sum of spatial costs of all live buffers must not
     exceed the capacity limit.
 
-    Since all start/end times are distinct integers, peak memory occurs at the
-    moment each buffer is initialized (time_start[i]).  We therefore check the
-    constraint at every time_start[i]: buffer j is live at that moment iff j
-    started before i (starts_after[i][j]) and has not yet ended (not
-    totally_after[i][j]).
+    Buffers are only allocated and freed between einsum steps, so it suffices
+    to check the constraint at each einsum's step pos[k].  Buffer j is live at
+    that step iff time_start[j] <= pos[k] <= time_end[j].  Read buffers only
+    occupy memory if they must be loaded (fused reads alias their producer's
+    buffer).
+
+    Only one direction is encoded (live => cost counted): the capacity sum
+    pushes the counted costs down on its own.
     """
     model = sm.model
     ops = sm.all_operands
 
-    for i in ops:
+    for k, e in enumerate(sm.einsums):
         active_costs = []
         for j in ops:
-            if i == j:
-                if i in sm.must_read:
-                    self_active_cost = model.NewIntVar(0, sm.capacity, f'active_cost_{i}_{j}')
-                    model.Add(self_active_cost == sm.spatial_cost[i]).OnlyEnforceIf(sm.must_read[i])
-                    model.Add(self_active_cost == 0).OnlyEnforceIf(sm.must_read[i].Not())
-                    active_costs.append(self_active_cost)
-                else:
-                    active_costs.append(sm.spatial_cost[i])
+            if j in e.operand_dims:
+                # Operands of einsum k are always live at its step
+                if j not in sm.must_read:
+                    active_costs.append(sm.spatial_cost[j])
+                    continue
+                live_conds = []
             else:
-                is_active = model.NewBoolVar(f'active_at_start_{i}_{j}')
-                model.AddBoolAnd(
-                    [sm.starts_after[i][j], sm.totally_after[i][j].Not()]
-                ).OnlyEnforceIf(is_active)
-                model.AddBoolOr(
-                    [sm.starts_after[i][j].Not(), sm.totally_after[i][j]]
-                ).OnlyEnforceIf(is_active.Not())
+                # j is live at step k unless k is before or after j's range
+                k_before = model.NewBoolVar(f'einsum_{k}_before_{j}')
+                k_after  = model.NewBoolVar(f'einsum_{k}_after_{j}')
+                model.Add(sm.pos[k] < sm.time_start[j]).OnlyEnforceIf(k_before)
+                model.Add(sm.time_end[j] < sm.pos[k]).OnlyEnforceIf(k_after)
+                live_conds = [k_before.Not(), k_after.Not()]
+            if j in sm.must_read:
+                live_conds.append(sm.must_read[j])
 
-                active_cost_ij = model.NewIntVar(0, sm.capacity, f'active_cost_{i}_{j}')
-                # if j in must_read, only actually active if must read
-                if j in sm.must_read:
-                    model.Add(active_cost_ij == sm.spatial_cost[j]).OnlyEnforceIf(is_active, sm.must_read[j])
-                    model.Add(active_cost_ij == 0).OnlyEnforceIf(is_active.Not())
-                    model.Add(active_cost_ij == 0).OnlyEnforceIf(sm.must_read[j].Not())
-                else:
-                    model.Add(active_cost_ij == sm.spatial_cost[j]).OnlyEnforceIf(is_active)
-                    model.Add(active_cost_ij == 0).OnlyEnforceIf(is_active.Not())
-                active_costs.append(active_cost_ij)
+            active_cost = model.NewIntVar(0, sm.capacity, f'active_cost_{k}_{j}')
+            model.Add(active_cost >= sm.spatial_cost[j]).OnlyEnforceIf(live_conds)
+            active_costs.append(active_cost)
 
         model.Add(sum(active_costs) <= sm.capacity)
 
@@ -1076,10 +1090,13 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
     ops = sm.all_operands
 
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        einsum_order = sorted(range(len(sm.einsums)), key=lambda k: solver.Value(sm.pos[k]))
+        print(f"Einsum order: {einsum_order}")
+
         # Per-operand summary
         for i in ops:
             print(f"Operand {i} (original name {sm.original_names[i]}):")
-            print(f"  Time interval: [{solver.Value(sm.time_start[i])}, {solver.Value(sm.time_end[i])})")
+            print(f"  Live steps: [{solver.Value(sm.time_start[i])}, {solver.Value(sm.time_end[i])}]")
             print(f"  Spatial factors: {{", end="")
             for d in sm.all_operand_dims[i]:
                 print(f"{d}: {solver.Value(sm.spatial_dim[i][d])}, ", end="")
@@ -1125,7 +1142,9 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
         ]
 
         def node_start_time(n):
-            return min(solver.Value(sm.time_start[op]) for op in n)
+            # A subtree may start before any of its root node's own buffers
+            subtree = [n] + strict_ancestor[n]
+            return min(solver.Value(sm.time_start[op]) for m in subtree for op in m)
 
         # Build direct-children mapping (descendants without an intermediate)
         children: Dict[tuple, list] = {tuple(n): [] for n in nodes}
@@ -1143,19 +1162,29 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
             children[n].sort(key=node_start_time)
         roots.sort(key=node_start_time)
 
-        # Map the latest init-time of each einsum's operands to a compute event
-        compute_events: Dict[int, tuple] = {}
+        # Each einsum computes at its step, in the node of its deepest operand
+        # (the operand that every other operand of the einsum is an ancestor of)
+        node_of = {op: tuple(n) for n in nodes for op in n}
+        compute_events: Dict[tuple, list] = {tuple(n): [] for n in nodes}
         for idx, e in enumerate(sm.einsums):
-            einsum_ops = [
-                k for k in ops
-                if k.endswith(f"_read_{idx}") or k.endswith(f"_write_{idx}")
-            ]
-            if einsum_ops:
-                latest_init = max(solver.Value(sm.time_start[op]) for op in einsum_ops)
-                out_op = next((k for k in einsum_ops if k.endswith(f"_write_{idx}")), None)
-                in_ops = [k for k in einsum_ops if k != out_op]
-                if out_op:
-                    compute_events[latest_init] = (idx, out_op, in_ops)
+            einsum_ops = list(e.operand_dims)
+            deepest = next(
+                o for o in einsum_ops
+                if all(solver.Value(sm.ancestor[x][o]) for x in einsum_ops))
+            in_ops = [o for o in einsum_ops if o != e.output_operand]
+            compute_events[node_of[deepest]].append(
+                (solver.Value(sm.pos[idx]), idx, e.output_operand, in_ops))
+
+        def fused_depth(op):
+            # Number of fusion hops back to the buffer's root, so aliases are
+            # printed after the buffer they alias when allocated at the same step
+            depth = 0
+            while True:
+                src = next((s for s in sm.fused
+                            if op in sm.fused[s] and solver.Value(sm.fused[s][op])), None)
+                if src is None:
+                    return depth
+                op, depth = src, depth + 1
 
         def print_tree(n: tuple, indent_level: int = 0,
                        dim_counts: Optional[Dict[str, int]] = None) -> None:
@@ -1195,16 +1224,20 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
 
             child_indent = indent_level
 
-            # Collect all events in this node (inits, frees, child subtrees)
+            # Collect all events in this node (inits, computes, child subtrees,
+            # frees).  Several events can share a step: allocations come
+            # before the step's compute/child subtree, and frees after it.
             events = []
             for op in n:
-                events.append((solver.Value(sm.time_start[op]), 'init', op))
-                events.append((solver.Value(sm.time_end[op]),   'free', op))
+                events.append((solver.Value(sm.time_start[op]), 0, fused_depth(op), 'init', op))
+                events.append((solver.Value(sm.time_end[op]),   2, 0, 'free', op))
             for c in children[n]:
-                events.append((node_start_time(c), 'child', c))
-            events.sort(key=lambda x: x[0])
+                events.append((node_start_time(c), 1, 0, 'child', c))
+            for ev in compute_events[n]:
+                events.append((ev[0], 1, 0, 'compute', ev[1:]))
+            events.sort(key=lambda x: x[:3])
 
-            for t, ev_type, item in events:
+            for t, _, _, ev_type, item in events:
                 if ev_type == 'init':
                     op = item
                     orig = sm.original_names[op]
@@ -1239,15 +1272,14 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
                         else:
                             print(f"{inner_indent}{op} = zeros({shape_tuple}) # time {t}")
 
-                    # Emit any compute event triggered at this time
-                    if t in compute_events:
-                        idx, write_op, in_ops = compute_events[t]
-                        operands_str = ", ".join(in_ops)
-                        op_type_str = (
-                            f" [{sm.einsums[idx].operation}]"
-                            if sm.einsums[idx].operation else ""
-                        )
-                        print(f"{inner_indent}{write_op} += compute_einsum_{idx}{op_type_str}({operands_str})")
+                elif ev_type == 'compute':
+                    idx, write_op, in_ops = item
+                    operands_str = ", ".join(in_ops)
+                    op_type_str = (
+                        f" [{sm.einsums[idx].operation}]"
+                        if sm.einsums[idx].operation else ""
+                    )
+                    print(f"{inner_indent}{write_op} += compute_einsum_{idx}{op_type_str}({operands_str}) # time {t}")
 
                 elif ev_type == 'free':
                     op = item
