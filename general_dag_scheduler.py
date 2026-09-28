@@ -172,12 +172,13 @@ class SchedulerModel:
     # time_start[i] / time_end[i]: unique integer timestamps for buffer lifetime of i
     time_start: Dict[str, cp_model.IntVar] = field(default_factory=dict)
     time_end: Dict[str, cp_model.IntVar] = field(default_factory=dict)
-    # contains[i][j]: time interval for i strictly contains that of j
-    contains: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
+    # win_start[x] / win_end[x]: time window enclosing every buffer in the subtree rooted at x's node
+    win_start: Dict[str, cp_model.IntVar] = field(default_factory=dict)
+    win_end: Dict[str, cp_model.IntVar] = field(default_factory=dict)
     # totally_after[i][j]: time interval for i is entirely after that of j
     totally_after: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
+    # starts_after[i][j]: time interval for i starts after that of j
     starts_after: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
-    ends_after: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
 
     # ── Factor variables (_build_factor_vars) ─────────────────────────────────
     # spatial_dim[op][dim]: spatial tiling factor for operand op along dim
@@ -272,20 +273,22 @@ def _build_tree_structure(sm: SchedulerModel) -> None:
 
 def _build_timeline(sm: SchedulerModel) -> None:
     """
-    Create per-operand start/end time variables and the interval-relationship
-    auxiliary booleans (contains, totally_after, starts_after, ends_after).
+    Create per-operand start/end time variables, per-operand subtree windows,
+    and the interval-relationship auxiliary booleans (totally_after,
+    starts_after).
 
     Constraints enforce:
     - start < end for every operand
     - all start/end timestamps are globally distinct (total order)
-    - if i is a strict ancestor of j, j's interval is contained in i's or
-      completely separate from it
-    - incomparable buffers (neither is ancestor of the other) never overlap
-    - hierarchical consistency: a strict ancestor relates to all its subtree
-      members identically (no subtree-splitting)
+    - x's window [win_start[x], win_end[x]] encloses the interval of every
+      buffer in the subtree rooted at x's node
+    - if p is a strict ancestor of x, p's interval either encloses x's whole
+      window or is completely separate from it (no subtree-splitting)
+    - windows of incomparable operands (neither is ancestor of the other) never
+      overlap, so each subtree occupies one contiguous block of time
     - all operands of the same einsum overlap in time
     - if i is the unique producer of an original operand, every reader of that
-      operand is totally after i
+      operand starts after i
     """
     model = sm.model
     ops = sm.all_operands
@@ -293,6 +296,8 @@ def _build_timeline(sm: SchedulerModel) -> None:
 
     sm.time_start = {i: model.NewIntVar(0, 2*N - 1, f'{i}_start') for i in ops}
     sm.time_end   = {i: model.NewIntVar(0, 2*N - 1, f'{i}_end')   for i in ops}
+    sm.win_start  = {x: model.NewIntVar(0, 2*N - 1, f'{x}_win_start') for x in ops}
+    sm.win_end    = {x: model.NewIntVar(0, 2*N - 1, f'{x}_win_end')   for x in ops}
 
     for i in ops:
         model.Add(sm.time_start[i] < sm.time_end[i])
@@ -300,74 +305,71 @@ def _build_timeline(sm: SchedulerModel) -> None:
     model.AddAllDifferent(
         [sm.time_start[i] for i in ops] + [sm.time_end[i] for i in ops])
 
-    sm.contains     = {i: {j: model.NewBoolVar(f'{i}_contains_{j}')     for j in ops if i != j} for i in ops}
     sm.totally_after = {i: {j: model.NewBoolVar(f'{i}_totally_after_{j}') for j in ops if i != j} for i in ops}
     sm.starts_after  = {i: {j: model.NewBoolVar(f'{i}_starts_after_{j}')  for j in ops if i != j} for i in ops}
-    sm.ends_after    = {i: {j: model.NewBoolVar(f'{i}_ends_after_{j}')    for j in ops if i != j} for i in ops}
 
     for i in ops:
         for j in ops:
             if i == j:
                 continue
 
-            # Define starts_after / ends_after via time comparisons
+            # Define starts_after via time comparisons
             model.Add(sm.time_start[i] > sm.time_start[j]).OnlyEnforceIf(sm.starts_after[i][j])
             model.Add(sm.time_start[i] < sm.time_start[j]).OnlyEnforceIf(sm.starts_after[i][j].Not())
-            model.Add(sm.time_end[i]   > sm.time_end[j]).OnlyEnforceIf(sm.ends_after[i][j])
-            model.Add(sm.time_end[i]   < sm.time_end[j]).OnlyEnforceIf(sm.ends_after[i][j].Not())
             model.Add(sm.starts_after[i][j] == sm.starts_after[j][i].Not())
-            model.Add(sm.ends_after[i][j]   == sm.ends_after[j][i].Not())
-
-            # Define contains
-            model.Add(sm.time_start[i] < sm.time_start[j]).OnlyEnforceIf(sm.contains[i][j])
-            model.Add(sm.time_end[i]   > sm.time_end[j]).OnlyEnforceIf(sm.contains[i][j])
-            model.AddBoolOr(sm.starts_after[i][j], sm.ends_after[j][i]).OnlyEnforceIf(
-                sm.contains[i][j].Not())
 
             # Define totally_after
             model.Add(sm.time_start[i] > sm.time_end[j]).OnlyEnforceIf(sm.totally_after[i][j])
             model.Add(sm.time_start[i] < sm.time_end[j]).OnlyEnforceIf(sm.totally_after[i][j].Not())
-
-            # Strict ancestor implies interval containment or total separation
-            model.AddBoolOr(
-                [sm.totally_after[i][j], sm.totally_after[j][i], sm.contains[i][j]]
-            ).OnlyEnforceIf(sm.ancestor[i][j], sm.ancestor[j][i].Not())
 
             # Producer must precede all readers of the same original operand
             if (sm.original_names[i] == sm.original_names[j]
                     and sm.operand_groups[sm.original_names[i]]["producer"] == i):
                 model.Add(sm.starts_after[j][i] == 1)
 
-    # Tree-incomparable buffers must not overlap
-    for i in ops:
-        for j in ops:
-            if i == j:
-                continue
-            model.AddBoolOr(
-                [sm.totally_after[i][j], sm.totally_after[j][i]]
-            ).OnlyEnforceIf(sm.ancestor[i][j].Not(), sm.ancestor[j][i].Not())
+    # Subtree windows.  Windows need only be outer bounds: a loose window can
+    # only force ancestors to live longer, so the solver prefers tight ones.
+    # Non-strict inequalities suffice below because every window bound is
+    # compared against distinct buffer timestamps.
+    for x in ops:
+        for y in ops:
+            # x's window encloses every buffer in x's subtree (including x)
+            model.Add(sm.win_start[x] <= sm.time_start[y]).OnlyEnforceIf(sm.ancestor[x][y])
+            model.Add(sm.time_end[y] <= sm.win_end[x]).OnlyEnforceIf(sm.ancestor[x][y])
+            # Same-node operands share a subtree, so share a window (redundant
+            # but safe: the intersection of their windows is always valid)
+            if x < y:
+                model.Add(sm.win_start[x] == sm.win_start[y]).OnlyEnforceIf(sm.same_node[x][y])
+                model.Add(sm.win_end[x] == sm.win_end[y]).OnlyEnforceIf(sm.same_node[x][y])
 
-    # Hierarchical timeline consistency: if p is a strict ancestor of q, and q
-    # is an ancestor of r, then p must relate to q and r identically in timesteps
-    # (no splitting a subtree by timestep).
     for p in ops:
-        for q in ops:
-            if p == q:
+        for x in ops:
+            if p == x:
                 continue
-            p_strict_anc_q = model.NewBoolVar(f'{p}_strict_anc_{q}')
-            model.AddBoolAnd([sm.ancestor[p][q], sm.ancestor[q][p].Not()]).OnlyEnforceIf(p_strict_anc_q)
-            model.AddBoolOr([sm.ancestor[p][q].Not(), sm.ancestor[q][p]]).OnlyEnforceIf(p_strict_anc_q.Not())
+            # Strict ancestor p encloses x's whole window, or is entirely
+            # before or after it.  This implies p relates identically to every
+            # buffer in x's subtree.
+            p_encloses = model.NewBoolVar(f'{p}_encloses_win_{x}')
+            p_before   = model.NewBoolVar(f'{p}_before_win_{x}')
+            p_after    = model.NewBoolVar(f'{p}_after_win_{x}')
+            model.Add(sm.time_start[p] <= sm.win_start[x]).OnlyEnforceIf(p_encloses)
+            model.Add(sm.win_end[x] <= sm.time_end[p]).OnlyEnforceIf(p_encloses)
+            model.Add(sm.time_end[p] <= sm.win_start[x]).OnlyEnforceIf(p_before)
+            model.Add(sm.win_end[x] <= sm.time_start[p]).OnlyEnforceIf(p_after)
+            model.AddBoolOr([p_encloses, p_before, p_after]).OnlyEnforceIf(
+                sm.ancestor[p][x], sm.ancestor[x][p].Not())
 
-            for r in ops:
-                if p == r or q == r:
-                    continue
-                cond = model.NewBoolVar(f'cond_match_rel_{p}_{q}_{r}')
-                model.AddBoolAnd([p_strict_anc_q, sm.ancestor[q][r]]).OnlyEnforceIf(cond)
-                model.AddBoolOr([p_strict_anc_q.Not(), sm.ancestor[q][r].Not()]).OnlyEnforceIf(cond.Not())
-
-                model.Add(sm.totally_after[p][q] == sm.totally_after[p][r]).OnlyEnforceIf(cond)
-                model.Add(sm.totally_after[q][p] == sm.totally_after[r][p]).OnlyEnforceIf(cond)
-                model.Add(sm.contains[p][q] == sm.contains[p][r]).OnlyEnforceIf(cond)
+    for idx, x in enumerate(ops):
+        for z in ops[idx + 1:]:
+            # Incomparable subtrees occupy disjoint windows.  Since each
+            # buffer's interval lies within its own window, this also keeps
+            # incomparable buffers from overlapping.
+            x_first = model.NewBoolVar(f'win_{x}_before_win_{z}')
+            z_first = model.NewBoolVar(f'win_{z}_before_win_{x}')
+            model.Add(sm.win_end[x] <= sm.win_start[z]).OnlyEnforceIf(x_first)
+            model.Add(sm.win_end[z] <= sm.win_start[x]).OnlyEnforceIf(z_first)
+            model.AddBoolOr([x_first, z_first]).OnlyEnforceIf(
+                sm.ancestor[x][z].Not(), sm.ancestor[z][x].Not())
 
     # All operands in the same einsum must have overlapping lifetimes and be
     # comparable in the tree (one must be an ancestor of the other).
