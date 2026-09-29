@@ -701,7 +701,7 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
             sm.total_temporal_dim[op][d] = add_mul_chain(
                 model,
                 [sm.temporal_dim_contribs[op][other_op][d] for other_op in ops],
-                1, sm.all_dim_sizes[d] * (2 ** len(ops)),
+                1, sm.all_dim_sizes[d] * 4, # can overshoot via imperfect tiling but not by much
                 f'total_temporal_dim_{op}_{d}'
             )
             sm.total_parallel_dim[op][d] = add_mul_chain(
@@ -714,10 +714,10 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
             # Equivalently: spatial[op][d] = ceil(dim_size[d] / (total_temporal[op][d] * total_parallel[op][d]))
             if d in sm.all_operand_dims[op]:
                 total_size = model.NewIntVar(
-                    1, sm.all_dim_sizes[d] * (2 ** len(ops)),
+                    1, sm.all_dim_sizes[d] * 4,
                     f'total_dim_size_{op}_{d}')
                 total_except_spatial = model.NewIntVar(
-                    1, sm.all_dim_sizes[d] * (2 ** len(ops)),
+                    1, sm.all_dim_sizes[d] * 4,
                     f'total_except_spatial_{op}_{d}')
                 model.AddMultiplicationEquality(
                     total_except_spatial, [sm.total_temporal_dim[op][d], sm.total_parallel_dim[op][d]])
