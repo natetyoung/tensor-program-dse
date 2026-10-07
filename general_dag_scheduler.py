@@ -33,7 +33,7 @@ from ortools.sat.python import cp_model
 
 # Re-export Einsum so callers that do `from general_dag_scheduler import Einsum`
 # continue to work unchanged.
-from scheduler_utils import Einsum, add_mul_chain
+from scheduler_utils import Einsum, add_mul_chain, normalize_accel_gran
 
 
 # ─── 1. Pre-processing ────────────────────────────────────────────────────────
@@ -814,11 +814,10 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
             if d not in max_useful_granularity:
                 max_useful_granularity[d] = 1
             if e.accel_gran and e.compute_cost > 0:
-                if d in e.accel_gran:
-                    max_useful_granularity[d] = max(max_useful_granularity[d], e.accel_gran[d])
-                elif 'PRODUCT' in e.accel_gran:
-                    max_useful_granularity[d] = max(
-                        max_useful_granularity[d], e.accel_gran['PRODUCT'])
+                # A single dim of a group could fill the whole axis by itself.
+                for dims, size in normalize_accel_gran(e):
+                    if d in dims or dims == ('PRODUCT',):
+                        max_useful_granularity[d] = max(max_useful_granularity[d], size)
 
     for op in ops:
         for dim in sm.op_allowed_temp_dims[op]:
@@ -966,7 +965,8 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
         if e.compute_cost > 0:
             min_possible_total_iters = 1
 
-            if len(e.accel_gran) == 1 and 'PRODUCT' in e.accel_gran:
+            if e.accel_gran and 'PRODUCT' in e.accel_gran:
+                normalize_accel_gran(e)  # validates PRODUCT is the only key
                 # Special case: only the product of all spatial dims matters.
                 for d in e.dim_sizes:
                     min_possible_total_iters *= sm.all_dim_sizes[d]
@@ -993,22 +993,33 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
                     e.accel_gran['PRODUCT']
                 )
             else:
-                # General case: ceildiv per dimension, then multiply.
+                # General case: ceildiv per group of dims, then multiply.  A
+                # group's dims share one accelerator axis, so the axis is
+                # filled by the product of their spatial factors.
+                groups = normalize_accel_gran(e)
+                grouped_dims = {d for dims, _ in groups for d in dims}
                 for d in e.dim_sizes:
-                    if d in e.accel_gran:
-                        min_possible_total_iters *= sm.all_dim_sizes[d] // e.accel_gran[d]
-                    else:
+                    if d not in grouped_dims:
                         min_possible_total_iters *= sm.all_dim_sizes[d]
 
                 inner_loop_repetitions: List[cp_model.IntVar] = []
-                for d in e.accel_gran:
-                    min_sp = model.NewIntVar(1, sm.all_dim_sizes[d], f'min_spatial_{i}_{d}')
-                    candidates = [sm.spatial_dim[op][d]
-                                  for op in e.operand_dims if d in sm.all_operand_dims[op]]
-                    model.AddMinEquality(min_sp, candidates)
+                for gi, (dims, size) in enumerate(groups):
+                    group_max = 1
+                    min_sps = []
+                    for d in dims:
+                        group_max *= sm.all_dim_sizes[d]
+                        min_sp = model.NewIntVar(1, sm.all_dim_sizes[d], f'min_spatial_{i}_{d}')
+                        candidates = [sm.spatial_dim[op][d]
+                                      for op in e.operand_dims if d in sm.all_operand_dims[op]]
+                        model.AddMinEquality(min_sp, candidates)
+                        min_sps.append(min_sp)
+                    min_possible_total_iters *= group_max // size
+
+                    group_product = add_mul_chain(
+                        model, min_sps, 1, group_max, f'group_product_{i}_{gi}')
                     repetitions = model.NewIntVar(
-                        1, sm.all_dim_sizes[d] // e.accel_gran[d] + 1, f'repetitions_{i}_{d}')
-                    model.AddDivisionEquality(repetitions, min_sp + e.accel_gran[d] - 1, e.accel_gran[d])
+                        1, group_max // size + 1, f'repetitions_{i}_{gi}')
+                    model.AddDivisionEquality(repetitions, group_product + size - 1, size)
                     inner_loop_repetitions.append(repetitions)
 
                 total_repetitions = add_mul_chain(
