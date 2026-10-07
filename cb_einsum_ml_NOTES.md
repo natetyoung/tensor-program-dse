@@ -1,11 +1,15 @@
 # `cb_einsum_ml_cpsat97.py` — context for the next agent
 
-A CP-SAT model that finds the tiling, loop order, parallelism and memory placement for a single einsum on a multi-level memory hierarchy. It is an extension of the single-level model in `cb_einsum_cpsat97.py`. Everything is in one function, `cb_einsum_ml`, plus a small independent evaluator, `evaluate_schedule`.
+A CP-SAT model that finds the tiling, loop order, parallelism and memory placement for a single einsum on a multi-level memory hierarchy. It is an extension of the single-level model in `cb_einsum_cpsat97.py`. The main pieces are:
+- `make_problem`: parses the architecture arguments into a `Problem`, which holds the units, memories, parents and multicast sets. The model and the evaluator both use it.
+- `cb_einsum_ml`: builds and solves the CP-SAT model and returns a `Schedule` NamedTuple. `r[0]` through `r[5]` still work for older callers.
+- `evaluate_schedule(problem, order, factors, par_rows)`: an independent plain-Python check of a schedule. It checks validity and computes tiles, traffic, energy, delay and port times.
 
 ## Running it
 - It needs `ortools==9.7.2996` (see `requirements.txt`). On the original machine this lived in the conda env `solvers`, run as `~/miniconda3/envs/solvers/bin/python`. The default `python` there did not have ortools.
 - `python cb_einsum_ml_cpsat97.py` runs the attention-projection example in `__main__`: a 3-level hierarchy with a 128×128 L0 array, multicast and EDP. It often runs to the 120 s time limit and ends FEASIBLE rather than OPTIMAL.
-- After every solve, the function cross-checks the solver's values against `evaluate_schedule` and plain-Python recomputations of energy, delay, multicast and compute accesses. A failed `assert` means the model and its intended semantics disagree. Treat that as a bug, not noise.
+- After every solve, the solver's tiles, traffic, energy and delay are asserted equal to `evaluate_schedule`'s. A failed `assert` means the model and its intended semantics disagree. Treat that as a bug, not noise.
+- **Every reformulation must keep these asserts passing.** That includes the performance ideas below. Keep `evaluate_schedule` independent of the model's encoding, or it stops being a check.
 
 ## Model in brief (read the docstring for the full semantics)
 - **Units and slots.**
@@ -22,7 +26,7 @@ A CP-SAT model that finds the tiling, loop order, parallelism and memory placeme
   - `'edp'` scales E and D to at most 2^30 each before multiplying, because the raw product overflows int64.
 - **Parallelism.** `fanouts[l]` replicates level `l` (its memories and the compute below). A tuple means a multi-dimensional array.
   - Parallel factors sit in the bucket just outside level `l`'s first slot.
-  - If a level uses any parallelism, every slot of the levels above it must come before every slot at or below it. That keeps the parallel bucket at a fixed index (`n_out[l]`).
+  - If a level uses any parallelism, every slot of the levels above it must come before every slot at or below it. That keeps the parallel bucket at a fixed index (`par_bucket[l]`).
   - The effective factors are the temporal factors times the parallel factors (`eff_vars`), so the existing cost formulas apply unchanged.
 - **Multicast.** `multicast[l]` is a bool, or one entry per array dimension (a flat operand list is allowed only for a 1-D fanout).
   - Inputs: a parent read is shared across instances that differ only in dims the operand lacks.
