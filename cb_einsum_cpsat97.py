@@ -84,7 +84,7 @@ def cb_einsum(
                         ]
                     ) 
                     # enforced if, for all op where dim does not participate, op is not placed i-1
-                elif i < len(operand_dims.keys()):
+                if i < len(operand_dims.keys()):
                     # dim does not participate in inner blocking level (move in)
                     model.Add(factor_vars[dim][-1] == 1).OnlyEnforceIf(
                         *[
@@ -97,7 +97,7 @@ def cb_einsum(
             # forbid temporal reduction
             if dim not in operand_dims[output_operand]:
                 # dim is reduction and would be temporal for output
-                model.Add(factor_vars[dim][-1] == 1).OnlyEnforceIf(
+                model.Add(factor_vars[dim][i] == 1).OnlyEnforceIf(
                     *[
                         placement_vars[output_operand][j].Not()
                         for j in range(i)
