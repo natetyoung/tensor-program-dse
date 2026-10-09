@@ -1,4 +1,5 @@
-from math import prod
+import warnings
+from math import isqrt, prod
 from typing import Dict, FrozenSet, List, NamedTuple, Tuple, Union
 from ortools.sat.python import cp_model
 
@@ -20,6 +21,8 @@ class Unit(NamedTuple):
     lvl: int
 
 MemKey = Tuple[int, int]  # (level, memory index); DRAM is (num_levels, 0)
+
+DELAY_CAP = 2**61  # largest compute port modeled; CP-SAT needs bounds <= int64max / 2
 
 class Problem(NamedTuple):
     '''Parsed inputs plus derived structure, shared by model and evaluator.'''
@@ -76,6 +79,10 @@ def add_mul_chain(model:cp_model.CpModel, components, lb, ub, pfx):
         model.AddMultiplicationEquality(new_var, (var, c))
         var = new_var
     return var
+
+def divisors(n):
+    small = [d for d in range(1, isqrt(n) + 1) if n % d == 0]
+    return sorted(set(small + [n // d for d in small]))
 
 def make_problem(operand_dims, output_operand, dim_sizes, capacities, level_costs=None,
                  dram_costs=MemCosts(), fanouts=None, multicast=False,
@@ -225,6 +232,90 @@ def evaluate_schedule(p:Problem, order, factors, par_rows):
         delay = max(delay, p.compute_time * -(-iters // instances[0]))
     return {'spatial': spatial, 'traffic': traffic, 'energy': energy, 'delay': delay, 'ports': ports}
 
+def print_loop_nest(order, factors, par_rows):
+    '''Print a schedule as nested loops, outermost first.'''
+    par_bucket = {l: sum(1 for u in order if u.lvl > l) for l in par_rows}
+    indent = 0
+    for b in range(len(order) + 1):
+        for dim, fs in factors.items():
+            if fs[b] > 1:
+                print(' ' * indent + dim + ' wrap', fs[b])
+                indent += 1
+        for l in sorted(par_rows):
+            if par_bucket[l] == b:
+                for s, row in enumerate(par_rows[l]):
+                    tag = '(L'+str(l)+(('.s'+str(s)) if len(par_rows[l]) > 1 else '')+')'
+                    for dim, f in row.items():
+                        if f > 1:
+                            print(' ' * indent + dim + ' parfor', f, tag)
+                            indent += 1
+        if b < len(order):
+            print(' ' * indent + 'LD/ST ' + order[b].op + ' @L' + str(order[b].lvl))
+
+def interchangeable_groups(operand_dims, dim_sizes):
+    '''Dims grouped by the set of operands they appear in.'''
+    groups = {}
+    for d in dim_sizes:
+        groups.setdefault(frozenset(op for op, dims in operand_dims.items() if d in dims), []).append(d)
+    return list(groups.values())
+
+def prime_exponents(n):
+    exps, q = {}, 2
+    while q * q <= n:
+        while n % q == 0:
+            exps[q] = exps.get(q, 0) + 1
+            n //= q
+        q += 1
+    if n > 1:
+        exps[n] = exps.get(n, 0) + 1
+    return exps
+
+def split_merged(groups, dim_sizes, order, factors, par_rows):
+    '''
+    Split a schedule over merged dims ('*'-joined group names) back into the
+    original dims. Costs depend only on each bucket's product over a group,
+    so any split of each merged factor whose per-dim totals are the dim
+    sizes is equivalent. Prime by prime, walk the merged factor's positions
+    (buckets outermost first; in each, the temporal factor, then the
+    parallel factors placed there) and fill one dim's exponent before the
+    next's. Requires perfect division.
+    '''
+    par_bucket = {l: sum(1 for u in order if u.lvl > l) for l in par_rows}
+    new_factors = {}
+    new_rows = {l: [{} for _ in rows] for l, rows in par_rows.items()}
+    for g in groups:
+        key = '*'.join(g)
+        positions = []  # (getter value, setter for dim d)
+        for b in range(len(order) + 1):
+            positions.append((factors[key][b], ('t', b)))
+            for l in sorted(par_rows):
+                if par_bucket[l] == b:
+                    for s, row in enumerate(par_rows[l]):
+                        if key in row:
+                            positions.append((row[key], ('p', l, s)))
+        parts = {d: [1] * len(positions) for d in g}
+        for q, total in prime_exponents(prod(dim_sizes[d] for d in g)).items():
+            need = [[d, prime_exponents(dim_sizes[d]).get(q, 0)] for d in g]
+            i = 0
+            for k, (value, _) in enumerate(positions):
+                a = prime_exponents(value).get(q, 0)
+                while a > 0:
+                    while need[i][1] == 0:
+                        i += 1
+                    take = min(a, need[i][1])
+                    parts[need[i][0]][k] *= q ** take
+                    need[i][1] -= take
+                    a -= take
+            assert all(n == 0 for _, n in need), ('merged factors do not divide exactly', key)
+        for d in g:
+            new_factors[d] = [1] * (len(order) + 1)
+            for k, (_, pos) in enumerate(positions):
+                if pos[0] == 't':
+                    new_factors[d][pos[1]] = parts[d][k]
+                else:
+                    new_rows[pos[1]][pos[2]][d] = parts[d][k]
+    return {d: new_factors[d] for d in dim_sizes}, new_rows
+
 def cb_einsum_ml(
     operand_dims:Dict[str,Tuple[str]],
     output_operand:str,
@@ -243,7 +334,13 @@ def cb_einsum_ml(
     break_ties = True,
     perfect_division = False,
     verbose = True,
-    time_limit = 120.0
+    time_limit = 120.0,
+    seed = None,
+    num_workers = None,
+    linearization_level = None,
+    redundant_bounds = False,
+    sparse_domains = False,
+    merge_dims = False
 ):
     '''
     Multi-level constrained-buckets model for a single einsum: chooses tiling
@@ -289,6 +386,20 @@ def cb_einsum_ml(
     - break_ties: fix the order of adjacent slots with no loops between them.
     - perfect_division: factors must multiply to exactly each dim size
       (otherwise at least, i.e. padding allowed).
+    - seed / num_workers / linearization_level: CP-SAT parameters (None
+      keeps CP-SAT's default).
+    - redundant_bounds: add implied lower bounds (traffic and tile
+      monotonicity across an operand's levels, each operand moved at least
+      once, compute and DRAM floors on delay and energy) to tighten the
+      proven bound. Does not change the optimum.
+    - sparse_domains: give temporal factors only the values an optimum can
+      take (divisors under perfect_division, else ceil(size/k)), and
+      parallel factors divisors under perfect_division.
+    - merge_dims: under perfect_division, solve with each group of dims
+      that appear in the same operands merged into one dim (costs depend
+      only on their product per bucket), then split the schedule back. The
+      returned schedule uses the original dims. Ignored without
+      perfect_division, where merging is not exact.
 
     Cost model: traffic of unit (op, l) moves data between level l and its
     parent (next level up holding op, or DRAM): inputs are read from the
@@ -302,8 +413,32 @@ def cb_einsum_ml(
     Returns a Schedule, or None if no solution was found. The solution is
     asserted against evaluate_schedule.
     '''
+    args = dict(locals())
     if objective not in ('edp', 'energy', 'delay'):
         raise ValueError('unknown objective '+objective)
+    groups = interchangeable_groups(operand_dims, dim_sizes)
+    if merge_dims and perfect_division and any(len(g) > 1 for g in groups):
+        gname = {d: '*'.join(g) for g in groups for d in g}
+        inner = cb_einsum_ml(**{
+            **args, 'merge_dims': False,
+            'operand_dims': {op: tuple(dict.fromkeys(gname[d] for d in dims))
+                             for op, dims in operand_dims.items()},
+            'dim_sizes': {'*'.join(g): prod(dim_sizes[d] for d in g) for g in groups}})
+        if inner is None:
+            return None
+        factors, rows = split_merged(groups, dim_sizes, inner.order, inner.factors, inner.par_rows)
+        p = make_problem(operand_dims, output_operand, dim_sizes, capacities, level_costs,
+                         dram_costs, fanouts, multicast, compute_time, compute_energy,
+                         compute_accesses)
+        ev = evaluate_schedule(p, inner.order, factors, rows)
+        assert (ev['energy'], ev['delay']) == (inner.energy, inner.delay), (ev['energy'], ev['delay'])
+        if verbose:
+            print('Split back to original dims:')
+            print_loop_nest(inner.order, factors, rows)
+        parallel = {l: {d: prod(row.get(d, 1) for row in rs) for d in dim_sizes
+                        if any(d in row for row in rs)} for l, rs in rows.items()}
+        return Schedule(inner.objective, inner.order, factors, inner.energy, inner.delay,
+                        parallel, rows)
     p = make_problem(operand_dims, output_operand, dim_sizes, capacities, level_costs,
                      dram_costs, fanouts, multicast, compute_time, compute_energy,
                      compute_accesses)
@@ -317,6 +452,24 @@ def cb_einsum_ml(
     total_fan = prod(prod(f) for f in p.fanouts)
     op_size = {op: prod(dim_sizes[d] for d in operand_dims[op]) for op in operands}
     name = {u: u.op+'_L'+str(u.lvl) for u in units}
+
+    # Factor domains. Every cost is non-decreasing in each temporal factor,
+    # so an optimum can shrink one until it is ceil(size / product of the
+    # dim's other factors); under perfect division that is a divisor.
+    # Parallel factors are only restricted under perfect division.
+    def par_domain(size, ub):
+        if sparse_domains and perfect_division:
+            return cp_model.Domain.FromValues([v for v in divisors(size) if v <= ub])
+        return cp_model.Domain(1, ub)
+    factor_domain = {}
+    for dim, size in dim_sizes.items():
+        if not sparse_domains:
+            factor_domain[dim] = cp_model.Domain(1, size)
+        elif perfect_division:
+            factor_domain[dim] = cp_model.Domain.FromValues(divisors(size))
+        else:
+            factor_domain[dim] = cp_model.Domain.FromValues(
+                sorted({-(-size // k) for k in range(1, size + 1)}))
 
     # placement_vars[u][g]: unit u occupies slot g (permutation)
     placement_vars = {u: [model.NewBoolVar(name[u]+'_pl_'+str(g)) for g in range(num_slots)]
@@ -373,7 +526,9 @@ def cb_einsum_ml(
     for l in par_levels:
         rows = []
         for s, size in enumerate(p.fanouts[l]):
-            row = {d: model.NewIntVar(1, min(size, dim_sizes[d]), 'par_L'+str(l)+'_'+str(s)+'_'+d)
+            row = {d: model.NewIntVarFromDomain(
+                       par_domain(dim_sizes[d], min(size, dim_sizes[d])),
+                       'par_L'+str(l)+'_'+str(s)+'_'+d)
                    for d in allowed_dims(l, s)}
             if row:
                 model.Add(add_mul_chain(model, list(row.values()), 1, size,
@@ -411,7 +566,8 @@ def cb_einsum_ml(
     for dim in dim_sizes:
         factor_vars[dim] = []
         for b in range(num_buckets):
-            factor_vars[dim].append(model.NewIntVar(1, dim_sizes[dim], dim+'_'+str(b)+'_factor'))
+            factor_vars[dim].append(model.NewIntVarFromDomain(factor_domain[dim],
+                                                              dim+'_'+str(b)+'_factor'))
             if enforce_optimal_placement:
                 for u in units:
                     # dim participates in unit just above bucket b (move out for free)
@@ -584,21 +740,51 @@ def cb_einsum_ml(
             ports.append((k, kind, pv))
     delay_terms = [pv for _, _, pv in ports]
 
-    # Compute: each compute unit runs its share of the iterations
+    # Compute: each compute unit runs its share of the iterations. CP-SAT
+    # bounds must stay within int64max / 2, so cap the compute port at
+    # DELAY_CAP; this only excludes schedules with very little parallelism,
+    # and the result is checked against the cap after solving.
     compute_var = None
+    excluded_delay = None
     if compute_time > 0:
-        iters_per_unit = model.NewIntVar(1, max_iters, 'iters_per_unit')
+        iters_ub = min(max_iters, DELAY_CAP // compute_time)
+        if iters_ub < max_iters:
+            excluded_delay = compute_time * (iters_ub + 1)
+        iters_per_unit = model.NewIntVar(1, iters_ub, 'iters_per_unit')
         model.AddDivisionEquality(iters_per_unit, max_iters + instances[0] - 1, instances[0])
-        compute_var = model.NewIntVar(0, compute_time * max_iters, 'compute_time')
+        compute_var = model.NewIntVar(0, compute_time * iters_ub, 'compute_time')
         model.Add(compute_var == compute_time * iters_per_unit)
         delay_terms.append(compute_var)
-        delay_ub = max(delay_ub, compute_time * max_iters)
+        delay_ub = max(delay_ub, compute_time * iters_ub)
 
     delay = model.NewIntVar(0, delay_ub, 'delay')
     if delay_terms:
         model.AddMaxEquality(delay, delay_terms)
     else:
         model.Add(delay == 0)
+
+    # Implied bounds, to tighten the proven bound. Moving a unit's slot
+    # inward only grows its traffic and shrinks its tile; every element of
+    # an operand crosses each of its units at least once, multicast or not
+    # (the shared factors are over dims the operand lacks).
+    if redundant_bounds:
+        for op in operands:
+            lvls = p.op_levels[op]
+            for inner, outer in zip(lvls, lvls[1:]):
+                model.Add(traffic_vars[Unit(op, inner)] >= traffic_vars[Unit(op, outer)])
+                model.Add(spatial_vars[Unit(op, inner)] <= spatial_vars[Unit(op, outer)])
+        for u in units:
+            model.Add(parent_traffic[u] >= op_size[u.op])
+        model.Add(energy >= compute_energy * max_iters + sum(
+            (p.mem_costs[p.endpoints(u)[0]].read_energy
+             + p.mem_costs[p.endpoints(u)[1]].write_energy) * op_size[u.op] for u in units))
+        if compute_var is not None:
+            model.Add(delay >= compute_time * -(-max_iters // total_fan))
+        dram = p.mem_costs[(num_levels, 0)]
+        model.Add(delay >= dram.read_time * sum(op_size[op] for op in operands
+                                                if op != output_operand and p.op_levels[op]))
+        if p.op_levels[output_operand]:
+            model.Add(delay >= dram.write_time * op_size[output_operand])
 
     if objective == 'energy':
         model.Minimize(energy)
@@ -619,6 +805,12 @@ def cb_einsum_ml(
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
+    if seed is not None:
+        solver.parameters.random_seed = seed
+    if num_workers is not None:
+        solver.parameters.num_workers = num_workers
+    if linearization_level is not None:
+        solver.parameters.linearization_level = linearization_level
     status = solver.Solve(model)
     if verbose:
         print(solver.ResponseStats())
@@ -632,22 +824,7 @@ def cb_einsum_ml(
                 for l in par_levels}
 
     if verbose:
-        indent = 0
-        for b in range(num_buckets):
-            for dim in dim_sizes:
-                if factors[dim][b] > 1:
-                    print(' ' * indent + dim + ' wrap', factors[dim][b])
-                    indent += 1
-            for l in par_levels:
-                if par_bucket[l] == b:
-                    for s, row in enumerate(par_vals[l]):
-                        tag = '(L'+str(l)+(('.s'+str(s)) if len(par_vals[l]) > 1 else '')+')'
-                        for dim, f in row.items():
-                            if f > 1:
-                                print(' ' * indent + dim + ' parfor', f, tag)
-                                indent += 1
-            if b < num_slots:
-                print(' ' * indent + 'LD/ST ' + order[b].op + ' @L' + str(order[b].lvl))
+        print_loop_nest(order, factors, par_vals)
         for lvl, mems in enumerate(p.memories):
             for m, mem in enumerate(mems):
                 print(p.label((lvl, m))+' Spatial Costs:',
@@ -674,6 +851,13 @@ def cb_einsum_ml(
     e_val, d_val = ev['energy'], ev['delay']
     assert e_val == solver.Value(energy) and d_val == solver.Value(delay), (e_val, d_val)
     obj_val = {'energy': e_val, 'delay': d_val, 'edp': e_val * d_val}[objective]
+    # schedules cut off by DELAY_CAP have delay >= excluded_delay and energy
+    # >= compute_energy * max_iters; warn if one could still have been better
+    if excluded_delay is not None and not (
+            objective == 'delay'
+            or (objective == 'edp' and obj_val <= excluded_delay * compute_energy * max_iters)):
+        warnings.warn('DELAY_CAP may have excluded a better schedule (compute port capped at '
+                      + str(excluded_delay - compute_time) + ')')
     if verbose:
         print('Energy:', e_val, 'Delay:', d_val, 'EDP:', e_val * d_val)
 

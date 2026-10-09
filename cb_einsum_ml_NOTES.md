@@ -7,7 +7,7 @@ A CP-SAT model that finds the tiling, loop order, parallelism and memory placeme
 
 ## Running it
 - It needs `ortools==9.7.2996` (see `requirements.txt`). On the original machine this lived in the conda env `solvers`, run as `~/miniconda3/envs/solvers/bin/python`. The default `python` there did not have ortools.
-- `python cb_einsum_ml_cpsat97.py` runs the attention-projection example in `__main__`: a 3-level hierarchy with a 128×128 L0 array, multicast and EDP. It often runs to the 120 s time limit and ends FEASIBLE rather than OPTIMAL.
+- `python cb_einsum_ml_cpsat97.py` runs the attention-projection example in `__main__`: a 3-level hierarchy with a 128×128 L0 array, multicast and EDP. It solves to OPTIMAL in about 5 s.
 - After every solve, the solver's tiles, traffic, energy and delay are asserted equal to `evaluate_schedule`'s. A failed `assert` means the model and its intended semantics disagree. Treat that as a bug, not noise.
 - **Every reformulation must keep these asserts passing.** That includes the performance ideas below. Keep `evaluate_schedule` independent of the model's encoding, or it stops being a check.
 
@@ -46,7 +46,26 @@ These use `mm = {'A': ('m','k'), 'B': ('k','n'), 'C': ('m','n')}` with `{'m': 40
 - With `compute_accesses=False`: energy is 140,694,749,184.
 - With the default `compute_accesses=True`: energy is 4,538,724,483,072. That is the same schedule plus the constant 4·2^40 − 2^24.
 
-## Performance ideas (none implemented yet), in suggested order
+## Performance ideas, in suggested order
+Items 1–4 are implemented as opt-in arguments, all off by default: `seed`, `num_workers`, `linearization_level`, `redundant_bounds`, `sparse_domains` and `merge_dims`. The benchmark ran the eight GPT-3 6.7B einsums with the `__main__` TPU-v4i parameters on 16 cores, taking the median of 3 seeds; see `../comparison/results/bench_cpsat.md`. Every run reached OPTIMAL. The summed CP-SAT walltime was:
+- 25.0 s for the baseline;
+- 23.3 s with `linearization_level=2`, which is within noise;
+- 17.5 s with `redundant_bounds`;
+- 6.5 s with `sparse_domains`;
+- 2.2 s with `merge_dims`;
+- 0.41 s with `redundant_bounds`, `sparse_domains` and `merge_dims` together, about 0.05 s per einsum;
+- 0.42 s with all four.
+
+No run changed the optimum. The matmul regression values below still hold with the options on, though that tiny padded case is slightly slower with them (0.28 s vs. 0.21 s).
+
+How `merge_dims` works:
+- `cb_einsum_ml` calls itself on the merged problem. Merged dims are named by joining the group with `'*'`, e.g. `b*m`.
+- It splits the result back with `split_merged`, prime by prime, as item 3 describes.
+- It re-checks the split schedule with `evaluate_schedule` on the original problem.
+- With `verbose` on, it prints both the merged loop nest and the split one.
+
+The compute port's bound is capped at `DELAY_CAP = 2**61`, because einsums with 2^48 or more iterations otherwise exceed CP-SAT's int64max / 2 limit. A warning fires if the cap could have excluded a better schedule.
+
 Benchmark each change on its own against `__main__`. Record time-to-OPTIMAL, or the final gap between the objective and `BestObjectiveBound()` at a fixed time limit. You can capture both by wrapping `cp_model.CpSolver.Solve` with a solution callback; that's how the original comparisons were done.
 
 1. **Make runs reproducible.** Set `solver.parameters.random_seed` and `num_workers`. Also try `linearization_level=2`, which can help with the weak bounds that products produce.
@@ -55,7 +74,7 @@ Benchmark each change on its own against `__main__`. Record time-to-OPTIMAL, or 
    - Each operand's inner tile is at most its outer tile.
    - Delay is at least `compute_time × ceil(iters / total_fan)`, and at least DRAM's time to move each operand once.
    - Energy is at least the cost of moving each operand into each level it lives in once.
-3. **Merge interchangeable dims** (when `perfect_division=True`).
+3. **Merge interchangeable dims** (when `perfect_division=True`). *Implemented as `merge_dims`; the padded case is not handled.*
    - Two dims are interchangeable if they appear in exactly the same operand set. In `__main__` that's `b` with `m`, and `h` with `e`.
    - Costs depend only on the product of such dims' factors in each bucket. So merge them into one dim, solve, then split back.
    - To split back, go prime by prime: walk the buckets from outermost to innermost, filling one dim's exponent first.
