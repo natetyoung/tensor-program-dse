@@ -27,6 +27,7 @@ Internal organisation
 """
 
 from dataclasses import dataclass, field
+from math import isqrt
 from typing import Dict, List, Optional, Tuple
 
 from ortools.sat.python import cp_model
@@ -188,7 +189,9 @@ class SchedulerModel:
     # Only defined for pairs of occurrences of the same original operand.
     totally_after: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
 
-    # ── Factor variables (_build_factor_vars) ─────────────────────────────────
+    # ── Factor variables (_build_factor_domains, _build_factor_vars) ──────────
+    # factor_values[dim]: values any factor along dim may take (None = all in range)
+    factor_values: Dict[str, Optional[List[int]]] = field(default_factory=dict)
     # spatial_dim[op][dim]: spatial tiling factor for operand op along dim
     spatial_dim: Dict[str, Dict[str, cp_model.IntVar]] = field(default_factory=dict)
     # temporal_dim[op][dim]: loop-count factor introduced at op's node along dim
@@ -410,6 +413,48 @@ def _build_timeline(sm: SchedulerModel) -> None:
                 model.AddBoolOr(sm.ancestor[op1][op2], sm.ancestor[op2][op1])
 
 
+def _divisors(n: int) -> List[int]:
+    small = [d for d in range(1, isqrt(n) + 1) if n % d == 0]
+    return sorted(set(small + [n // d for d in small]))
+
+
+def _build_factor_domains(sm: SchedulerModel, sparse_domains: bool,
+                          perfect_factorization: bool) -> None:
+    """
+    Fill sm.factor_values: per dim, the values a spatial, temporal or parallel
+    factor may take (None means every value in range).
+
+    With sparse_domains these are the divisors of the dim size under perfect
+    factorization, else {ceil(size / k) : k >= 1}.  Sound because every
+    spatial factor is ceil(size / product of the temporal and parallel
+    factors on its path), so it depends on each such factor f only through
+    ceil(size / f): replacing f by ceil(size / ceil(size / f)) <= f, which is
+    in the set, leaves every spatial factor unchanged and no cost increases
+    (traffic, fills and compute iterations are non-decreasing in temporal
+    factors and do not depend on parallel ones otherwise).  A factor no
+    descendant tiles is unconstrained and can drop to 1.  Under perfect
+    factorization each factor divides the dim size.  Must be revisited if a
+    cost ever becomes decreasing in some factor.
+    """
+    sm.factor_values = {}
+    for dim, size in sm.all_dim_sizes.items():
+        if not sparse_domains:
+            sm.factor_values[dim] = None
+        elif perfect_factorization:
+            sm.factor_values[dim] = _divisors(size)
+        else:
+            sm.factor_values[dim] = sorted({-(-size // k) for k in range(1, size + 1)})
+
+
+def _new_factor_var(sm: SchedulerModel, dim: str, ub: int, name: str) -> cp_model.IntVar:
+    """A factor variable for dim in [1, ub], restricted to sm.factor_values[dim]."""
+    values = sm.factor_values[dim]
+    if values is None:
+        return sm.model.NewIntVar(1, ub, name)
+    return sm.model.NewIntVarFromDomain(
+        cp_model.Domain.FromValues([v for v in values if v <= ub]), name)
+
+
 def _build_factor_vars(sm: SchedulerModel) -> None:
     """
     Create the spatial and temporal factor variables.
@@ -421,24 +466,23 @@ def _build_factor_vars(sm: SchedulerModel) -> None:
     spatial consistency across fused pairs) and _build_factor_constraints (for
     temporal ancestor/anchor constraints).
     """
-    model = sm.model
     sm.spatial_dim = {
         op: {
-            dim: model.NewIntVar(1, sm.all_dim_sizes[dim], f'{op}_sp_{dim}')
+            dim: _new_factor_var(sm, dim, sm.all_dim_sizes[dim], f'{op}_sp_{dim}')
             for dim in sm.all_operand_dims[op]
         }
         for op in sm.all_operands
     }
     sm.temporal_dim = {
         op: {
-            dim: model.NewIntVar(1, sm.all_dim_sizes[dim], f'{op}_tp_{dim}')
+            dim: _new_factor_var(sm, dim, sm.all_dim_sizes[dim], f'{op}_tp_{dim}')
             for dim in sm.op_allowed_temp_dims[op]
         }
         for op in sm.all_operands
     }
     sm.parallel_dim = {
         op: {
-            dim: model.NewIntVar(1, min(sm.num_cores, sm.all_dim_sizes[dim]), f'{op}_par_{dim}')
+            dim: _new_factor_var(sm, dim, min(sm.num_cores, sm.all_dim_sizes[dim]), f'{op}_par_{dim}')
             for dim in sm.op_allowed_temp_dims[op]
         }
         for op in sm.all_operands
@@ -701,8 +745,8 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
         for other_op in ops:
             sm.temporal_dim_contribs[op][other_op] = {}
             for d in sm.op_allowed_temp_dims[op]:
-                contrib = model.NewIntVar(1, sm.all_dim_sizes[d],
-                                         f'temp_contrib_{op}_{other_op}_{d}')
+                contrib = _new_factor_var(sm, d, sm.all_dim_sizes[d],
+                                          f'temp_contrib_{op}_{other_op}_{d}')
                 sm.temporal_dim_contribs[op][other_op][d] = contrib
                 if d in sm.temporal_dim[other_op]:
                     model.Add(contrib == sm.temporal_dim[other_op][d]).OnlyEnforceIf(
@@ -717,8 +761,8 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
         for other_op in ops:
             sm.parallel_dim_contribs[op][other_op] = {}
             for d in sm.op_allowed_temp_dims[op]:
-                contrib = model.NewIntVar(1, min(sm.num_cores, sm.all_dim_sizes[d]),
-                                         f'par_contrib_{op}_{other_op}_{d}')
+                contrib = _new_factor_var(sm, d, min(sm.num_cores, sm.all_dim_sizes[d]),
+                                          f'par_contrib_{op}_{other_op}_{d}')
                 sm.parallel_dim_contribs[op][other_op][d] = contrib
                 if d in sm.parallel_dim[other_op]:
                     model.Add(contrib == sm.parallel_dim[other_op][d]).OnlyEnforceIf(
@@ -1417,7 +1461,12 @@ def scheduler(
     allow_spilling: bool = False,
     debug: bool = True,
     perfect_factorization: bool = False,
-    partial_sums: bool = False
+    partial_sums: bool = False,
+    sparse_domains: bool = False,
+    time_limit: Optional[float] = None,
+    seed: Optional[int] = None,
+    num_workers: Optional[int] = None,
+    linearization_level: Optional[int] = None
 ) -> Tuple['SchedulerModel', cp_model.CpSolver]:
     """
     Synthesize a schedule-tree / loop-tree structure for a DAG of einsums.
@@ -1443,6 +1492,16 @@ def scheduler(
                                sum back, adding to the output's traffic.  Such
                                loops may not enclose a consumer of the output.
                                If False, they are forbidden.
+    sparse_domains           : If True, give spatial, temporal and parallel
+                               factors only the values an optimum can take:
+                               divisors of the dim size under
+                               perfect_factorization, else ceil(size / k).
+                               Does not change the optimum.
+    time_limit / seed / num_workers / linearization_level
+                             : CP-SAT parameters (None keeps CP-SAT's
+                               default).  Multi-worker search is
+                               nondeterministic; fix seed and num_workers to
+                               compare runs.
 
     Returns
     ───────
@@ -1482,6 +1541,7 @@ def scheduler(
     # ── Step 3: Build model phases in dependency order ────────────────────────
     _build_tree_structure(sm)
     _build_timeline(sm)
+    _build_factor_domains(sm, sparse_domains, perfect_factorization)
     _build_factor_vars(sm)           # must come before _build_fusion (spatial_dim used there)
     _build_fusion(sm, allow_spilling)
     _build_factor_constraints(sm, partial_sums)  # must come after _build_fusion (uses is_anchor, ancestor)
@@ -1496,6 +1556,14 @@ def scheduler(
 
     # ── Step 4: Solve ─────────────────────────────────────────────────────────
     solver = cp_model.CpSolver()
+    if time_limit is not None:
+        solver.parameters.max_time_in_seconds = time_limit
+    if seed is not None:
+        solver.parameters.random_seed = seed
+    if num_workers is not None:
+        solver.parameters.num_workers = num_workers
+    if linearization_level is not None:
+        solver.parameters.linearization_level = linearization_level
     status = solver.Solve(sm.model)
     if debug:
         print(solver.SolutionInfo())
