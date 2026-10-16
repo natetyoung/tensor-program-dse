@@ -57,10 +57,13 @@ class UniqueDAG:
     all_dim_sizes: Dict[str, int]                  # dim_name -> size
 
 
-def uniquify_einsums(einsums: List[Einsum]) -> UniqueDAG:
+def uniquify_einsums(einsums: List[Einsum], partial_sums: bool = False) -> UniqueDAG:
     """
     Rename operand occurrences to be unique across the DAG and return the
     resulting UniqueDAG.  No CP-SAT objects are created here.
+
+    With partial_sums, outputs may also be tiled in their einsum's reduction
+    dims (partial-sum spilling); otherwise only in their own dims.
 
     Raises ValueError if any output operand name is produced by more than one
     einsum.
@@ -103,10 +106,12 @@ def uniquify_einsums(einsums: List[Einsum]) -> UniqueDAG:
             new_operand_dims[new_op] = dims
             original_names[new_op] = op
             all_operand_dims[new_op] = dims
-            # Outputs may only be tiled in their own dims; inputs can be tiled
-            # in any dim of the enclosing einsum (reduction dims included).
+            # Outputs may only be tiled in their own dims (unless partial sums
+            # may spill); inputs can be tiled in any dim of the enclosing
+            # einsum (reduction dims included).
             op_allowed_temp_dims[new_op] = (
-                list(dims) if op == e.output_operand else list(e.dim_sizes.keys())
+                list(dims) if op == e.output_operand and not partial_sums
+                else list(e.dim_sizes.keys())
             )
             for d in dims:
                 if d not in all_dim_sizes:
@@ -214,7 +219,11 @@ class SchedulerModel:
     temporal_if_not_fused_cost: Dict[str, cp_model.IntVar] = field(default_factory=dict)
     # total_temporal_cost[op]: temporal_if_not_fused_cost[op] if op is not fused, else 0
     total_temporal_cost: Dict[str, cp_model.IntVar] = field(default_factory=dict)
-    # total_cost_vars[op]: spatial_cost * total_temporal_cost (= memory traffic cost for op)
+    # partial_sum_fills[op]: (outputs, only with partial_sums) partial sums read back from
+    # off-chip memory: every write of an element except its first
+    partial_sum_fills: Dict[str, cp_model.IntVar] = field(default_factory=dict)
+    # total_cost_vars[op]: spatial_cost * total_temporal_cost, plus any partial-sum fills
+    # (= memory traffic cost for op)
     total_cost_vars: Dict[str, cp_model.IntVar] = field(default_factory=dict)
     # all_compute_iters[i]: total compute iterations for uniquified einsum i (or 0 if no compute cost)
     all_compute_iters: List = field(default_factory=list)
@@ -550,13 +559,17 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
                 model.Add(sm.must_write[op] == 0)
 
 
-def _build_factor_constraints(sm: SchedulerModel) -> None:
+def _build_factor_constraints(sm: SchedulerModel, partial_sums: bool = False) -> None:
     """
     Add constraints on temporal_dim variables that reflect tree-structure rules.
 
     - If i is an ancestor of j and a dim in i's allowed temporal dims is NOT
-      in j's, then i's temporal and parallel factors for that dim must be 1 
-      (we would introduce recompute for j's einsum otherwise).
+      in j's, then i's temporal and parallel factors for that dim must be 1
+      (we would introduce recompute for j's einsum otherwise).  Unless
+      partial_sums, an output's allowed dims exclude its reduction dims, so
+      this also forbids temporal reduction outside it (partial-sum spilling).
+    - With partial_sums, a temporal reduction loop enclosing an output must
+      not also enclose a consumer of it (it would read an incomplete sum).
     - Non-anchor operands must have all temporal and parallel factors equal 
       to 1 (only the anchor's factors count for the node).
     - Reinterpreted dimensions (a dimension present in one occurrence but not
@@ -601,6 +614,23 @@ def _build_factor_constraints(sm: SchedulerModel) -> None:
                             model.Add(sm.parallel_dim[op][dim] == 1).OnlyEnforceIf(
                                 sm.ancestor[op][u2])
 
+    # Partial sums: a temporal reduction loop enclosing an output must not
+    # also enclose a consumer of that output.  The first rule above already
+    # forbids this unless the consumer's einsum has a dim of the same name;
+    # this covers that case.  (A consumer of a consumer inside the loop forces
+    # the consumer itself inside, by the timeline constraints.)
+    if partial_sums:
+        for e in sm.einsums:
+            o = e.output_operand
+            for c in sm.operand_groups[sm.original_names[o]]["consumers"]:
+                for dim in e.dim_sizes:
+                    if dim in sm.all_operand_dims[o] or dim not in sm.op_allowed_temp_dims[c]:
+                        continue
+                    for a in ops:
+                        if dim in sm.temporal_dim[a]:
+                            model.Add(sm.temporal_dim[a][dim] == 1).OnlyEnforceIf(
+                                sm.ancestor[a][o], sm.ancestor[a][c])
+
     # Hierarchical spatial bounds: if i is an ancestor of j, then i's spatial tile
     # must physically contain j's spatial tile for any shared dimension.
     for i in ops:
@@ -621,7 +651,8 @@ def _build_factor_constraints(sm: SchedulerModel) -> None:
                     model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[a][o])
                     model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[o][a])
 
-def _build_cost_vars(sm: SchedulerModel) -> None:
+def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
+                     partial_sums: bool = False) -> None:
     """
     Build all cost-related variables:
 
@@ -630,7 +661,10 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
     total_temporal_dim[op][dim]   product of ancestor contributions for dim
     temporal_if_not_fused_cost    product of total_temporal_dim values
     total_temporal_cost           temporal cost gated by must_write/must_read
-    total_cost_vars               spatial * temporal  (memory traffic)
+    partial_sum_fills             (partial_sums only) writes of an output
+                                  element after its first, each of which reads
+                                  the partial sum back in
+    total_cost_vars               spatial * temporal + fills  (memory traffic)
 
     Also adds the dim-fidelity constraints:
       spatial[op][d] * total_temporal[op][d] ≥ dim_size[d]
@@ -652,6 +686,7 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
         )
 
     # Temporal costs
+    own_temporal_cost: Dict[str, cp_model.IntVar] = {}  # outputs that may spill partial sums
     for op in ops:
         allowed_dim_product = 1
         for d in sm.op_allowed_temp_dims[op]:
@@ -723,7 +758,10 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
                     total_except_spatial, [sm.total_temporal_dim[op][d], sm.total_parallel_dim[op][d]])
                 model.AddMultiplicationEquality(
                     total_size, [sm.spatial_dim[op][d], total_except_spatial])
-                model.Add(total_size >= sm.all_dim_sizes[d])
+                if perfect_factorization:
+                    model.Add(total_size == sm.all_dim_sizes[d])
+                else:
+                    model.Add(total_size >= sm.all_dim_sizes[d])
                 model.AddDivisionEquality(
                     sm.spatial_dim[op][d],
                     sm.all_dim_sizes[d] + total_except_spatial - 1,
@@ -740,9 +778,23 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
         model.Add(total_path_parallel <= sm.num_cores)
 
         # temporal_if_not_fused_cost = product of total_temporal_dim values
+        temporal_dims = list(sm.total_temporal_dim[op].values())
+        reduction_dims = [d for d in sm.op_allowed_temp_dims[op]
+                          if d not in sm.all_operand_dims[op]]
+        if partial_sums and op in sm.must_write and reduction_dims:
+            # Split off the product over the output's own dims: each element
+            # is first written once per visit of those loops.
+            own_temporal_cost[op] = add_mul_chain(
+                model,
+                [sm.total_temporal_dim[op][d] for d in sm.all_operand_dims[op]],
+                1, max_temporal_cost,
+                f'own_temporal_{op}'
+            )
+            temporal_dims = ([own_temporal_cost[op]]
+                             + [sm.total_temporal_dim[op][d] for d in reduction_dims])
         sm.temporal_if_not_fused_cost[op] = add_mul_chain(
             model,
-            list(sm.total_temporal_dim[op].values()),
+            temporal_dims,
             1, max_temporal_cost,
             f'temporal_if_not_fused_{op}'
         )
@@ -770,14 +822,30 @@ def _build_cost_vars(sm: SchedulerModel) -> None:
         for d in sm.op_allowed_temp_dims[op]:
             allowed_dim_product *= sm.all_dim_sizes[d]
 
-        sm.total_cost_vars[op] = model.NewIntVar(
-            0, allowed_dim_product * (2 ** len(sm.op_allowed_temp_dims[op])),
-            f'total_cost_{op}'
-        )
+        max_traffic = allowed_dim_product * (2 ** len(sm.op_allowed_temp_dims[op]))
+        traffic = model.NewIntVar(
+            0, max_traffic,
+            f'traffic_{op}' if op in own_temporal_cost else f'total_cost_{op}')
         model.AddMultiplicationEquality(
-            sm.total_cost_vars[op],
+            traffic,
             (sm.spatial_cost[op], sm.total_temporal_cost[op])
         )
+        if op in own_temporal_cost:
+            # Partial-sum fills: every write of an output element but its
+            # first reads the partial sum back.  First writes are the (padded,
+            # per-core) output size; without temporal reduction loops outside
+            # the buffer they equal the traffic, so fills are zero.
+            first_writes = model.NewIntVar(0, max_traffic, f'first_writes_{op}')
+            model.AddMultiplicationEquality(
+                first_writes, (sm.spatial_cost[op], own_temporal_cost[op]))
+            sm.partial_sum_fills[op] = model.NewIntVar(0, max_traffic, f'partial_sum_fills_{op}')
+            model.Add(sm.partial_sum_fills[op] == traffic - first_writes).OnlyEnforceIf(
+                sm.must_write[op])
+            model.Add(sm.partial_sum_fills[op] == 0).OnlyEnforceIf(sm.must_write[op].Not())
+            sm.total_cost_vars[op] = model.NewIntVar(0, 2 * max_traffic, f'total_cost_{op}')
+            model.Add(sm.total_cost_vars[op] == traffic + sm.partial_sum_fills[op])
+        else:
+            sm.total_cost_vars[op] = traffic
         # If an operand is not fused, its total cost must be at least its full size.
         if op in sm.must_write:
             model.Add(sm.total_cost_vars[op] >= op_size // sm.num_cores).OnlyEnforceIf(sm.must_write[op])
@@ -1280,6 +1348,9 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
                     else:
                         if "_read_" in op:
                             print(f"{inner_indent}{op} = load({orig}, size={shape_tuple}) # time {t}")
+                        elif op in sm.partial_sum_fills and solver.Value(sm.partial_sum_fills[op]) > 0:
+                            print(f"{inner_indent}{op} = zeros({shape_tuple}) if first visit "
+                                  f"else load({orig}, size={shape_tuple}) # partial sums, time {t}")
                         else:
                             print(f"{inner_indent}{op} = zeros({shape_tuple}) # time {t}")
 
@@ -1320,11 +1391,13 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
             print(f"Einsum {i} (compute cost {e.compute_cost}): "
                   f"{solver.Value(sm.all_compute_iters[i])} iterations")
     for op in ops:
+        fills = (f", partial-sum fills {solver.Value(sm.partial_sum_fills[op])}"
+                 if op in sm.partial_sum_fills else "")
         print(
             f"Operand {op} (original name {sm.original_names[op]}): "
             f"total cost {solver.Value(sm.total_cost_vars[op])} "
             f"(spatial {solver.Value(sm.spatial_cost[op])}, "
-            f"temporal {solver.Value(sm.total_temporal_cost[op])})"
+            f"temporal {solver.Value(sm.total_temporal_cost[op])}{fills})"
         )
     if solver.Value(sm.final_compute_cost) > solver.Value(sm.final_communication_cost):
         print(f"Final cost = {solver.Value(sm.final_compute_cost)} (compute dominated vs {solver.Value(sm.final_communication_cost)})")
@@ -1343,6 +1416,8 @@ def scheduler(
     enforce_optimal_placement: bool = True,
     allow_spilling: bool = False,
     debug: bool = True,
+    perfect_factorization: bool = False,
+    partial_sums: bool = False
 ) -> Tuple['SchedulerModel', cp_model.CpSolver]:
     """
     Synthesize a schedule-tree / loop-tree structure for a DAG of einsums.
@@ -1360,6 +1435,14 @@ def scheduler(
     allow_spilling           : If True, allow intermediate operands to be
                                written to and read from off-chip memory.
     debug                    : If True, print model-building progress.
+    perfect_factorization    : If True, forbid factors which do not divide the problem size evenly.
+    partial_sums             : If True, allow temporal reduction loops outside
+                               an einsum's output buffer (partial-sum
+                               spilling).  Each write of an output element
+                               except its first then also reads the partial
+                               sum back, adding to the output's traffic.  Such
+                               loops may not enclose a consumer of the output.
+                               If False, they are forbidden.
 
     Returns
     ───────
@@ -1368,7 +1451,7 @@ def scheduler(
     solver.Value(sm.<variable>[...]).
     """
     # ── Step 1: Pre-process ───────────────────────────────────────────────────
-    dag = uniquify_einsums(einsums)
+    dag = uniquify_einsums(einsums, partial_sums)
 
     if debug:
         print("Operand Name Uniquification Results:")
@@ -1401,8 +1484,8 @@ def scheduler(
     _build_timeline(sm)
     _build_factor_vars(sm)           # must come before _build_fusion (spatial_dim used there)
     _build_fusion(sm, allow_spilling)
-    _build_factor_constraints(sm)    # must come after _build_fusion (uses is_anchor, ancestor)
-    _build_cost_vars(sm)             # must come after both factor and fusion phases
+    _build_factor_constraints(sm, partial_sums)  # must come after _build_fusion (uses is_anchor, ancestor)
+    _build_cost_vars(sm, perfect_factorization, partial_sums)  # must come after both factor and fusion phases
     if enforce_optimal_placement:
         _build_optimality_constraints(sm)
     _build_capacity_constraint(sm)   # uses spatial_cost from _build_cost_vars
@@ -1544,28 +1627,28 @@ if __name__ == '__main__':
     # scheduler( #FULL SIX EINSUM GPT
     #     [
     #         Einsum(
-    #             {'L0_X': ('m', 'd'), 'L0_WQ': ('d', 'k'), 'L0_Q_spill': ('m', 'k')}, 
-    #             'L0_Q_spill', 
+    #             {'L0_X': ('m', 'd'), 'L0_WQ': ('d', 'k'), 'L0_Q': ('m', 'k')}, 
+    #             'L0_Q', 
     #             {'m': 2048, 'd': 4096, 'k': 4096}
     #         ),
     #         Einsum(
-    #             {'L0_Q': ('m', 'k'), 'L0_K': ('n', 'k'), 'L0_S_spill': ('m', 'n')},
-    #             'L0_S_spill', 
+    #             {'L0_Q': ('m', 'k'), 'L0_K': ('n', 'k'), 'L0_S': ('m', 'n')},
+    #             'L0_S', 
     #             {'m': 2048, 'n': 2048, 'k': 4096}
     #         ), 
     #         Einsum(
-    #             {'L0_S': ('m', 'n'), 'L0_V': ('n', 'k1'), 'L0_O_spill': ('m', 'k1')},
-    #             'L0_O_spill', 
+    #             {'L0_S': ('m', 'n'), 'L0_V': ('n', 'k1'), 'L0_O': ('m', 'k1')},
+    #             'L0_O', 
     #             {'m': 2048, 'n': 2048, 'k1': 4096}
     #         ), 
     #         Einsum(
-    #             {'L0_O': ('m', 'k1'), 'L0_Wo': ('k1', 'd1'), 'L0_Y_spill': ('m', 'd1')},
-    #             'L0_Y_spill',
+    #             {'L0_O': ('m', 'k1'), 'L0_Wo': ('k1', 'd1'), 'L0_Y': ('m', 'd1')},
+    #             'L0_Y',
     #             {'m': 2048, 'k1': 4096, 'd1': 4096}
     #         ), 
     #         Einsum(
-    #             {'L0_Y': ('m', 'd1'), 'L0_W1': ('d1', 'f1'), 'L0_H_spill': ('m', 'f1')},
-    #             'L0_H_spill',
+    #             {'L0_Y': ('m', 'd1'), 'L0_W1': ('d1', 'f1'), 'L0_H': ('m', 'f1')},
+    #             'L0_H',
     #             {'m': 2048, 'd1': 4096, 'f1': 16384}
     #         ),
     #         Einsum(
@@ -1575,5 +1658,35 @@ if __name__ == '__main__':
     #         )
     #     ],
     #     8 * 1024 * 1024,
-    #     allow_spilling=True
+    #     allow_spilling=True,
+    #     perfect_factorization=True
+    # )
+    # def generate_matmul_chain(num_einsums, m, k_n_seq):
+    #     ret = []
+    #     dim_names = ('m', 'k', 'n0')
+    #     op_names = ('A', 'B0', 'C0')
+    #     for i in range(num_einsums):
+    #         sizes = (m, k_n_seq[i % len(k_n_seq)][0], k_n_seq[i % len(k_n_seq)][1])
+    #         dim_sizes = {dim_names[j]: sizes[j] for j in range(3)}
+    #         output_name = op_names[2]
+    #         ret.append(Einsum(
+    #             {op_names[0]: (dim_names[0], dim_names[1]), op_names[1]: (dim_names[1], dim_names[2]), output_name: (dim_names[0], dim_names[2])}, 
+    #             output_name, 
+    #             dim_sizes
+    #         ))
+    #         dim_names = (dim_names[0], dim_names[2], 'n' + str(i+1))
+    #         op_names = (op_names[2], 'B' + str(i+1), 'C' + str(i+1))
+    #     return ret
+    # # print(generate_matmul_chain(2, 1024, [(4096, 4096)]))
+    # # print(generate_matmul_chain(2, 32*1024, [(4*1024, 16*1024), (16*1024, 4*1024)]))
+    # # cb_full_tree(
+    # #     generate_matmul_chain(2, 32*1024, [(4*1024, 16*1024), (16*1024, 4*1024)]),
+    # #     512 * 1024
+    # # )
+    # print(generate_matmul_chain(8, 8*1024, [(16*1024, 16*1024), (16*1024, 4*1024), (4*1024, 4*1024), (4*1024, 16*1024)]))
+    # scheduler(
+    #     generate_matmul_chain(8, 8*1024, [(16*1024, 16*1024), (16*1024, 4*1024), (4*1024, 4*1024), (4*1024, 16*1024)]),
+    #     512 * 1024,
+    #     allow_spilling=True,
+    #     perfect_factorization=True
     # )
