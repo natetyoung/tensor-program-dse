@@ -26,6 +26,7 @@ Internal organisation
                                  solve → print_schedule, returns (sm, solver).
 """
 
+import warnings
 from dataclasses import dataclass, field
 from math import isqrt
 from typing import Dict, List, Optional, Tuple
@@ -1060,7 +1061,8 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
     For einsums with compute_cost > 0, the number of iterations is determined
     by dividing spatial dimensions by the accelerator granularity (either per-
     dim or as a product), then multiplying by the maximum temporal cost of any
-    operand in the einsum (reflecting the innermost loop depth).
+    operand in the einsum (reflecting the innermost loop depth).  Dims with no
+    accel_gran entry have granularity 1 (with a warning).
 
     Objective: minimise   Σ_e  compute_cost_e × iters_e
                         + Σ_op total_cost_vars_op
@@ -1107,12 +1109,18 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
             else:
                 # General case: ceildiv per group of dims, then multiply.  A
                 # group's dims share one accelerator axis, so the axis is
-                # filled by the product of their spatial factors.
+                # filled by the product of their spatial factors.  A dim with
+                # no accel_gran entry is processed one element per step, i.e.
+                # it is its own group of granularity 1.
                 groups = normalize_accel_gran(e)
                 grouped_dims = {d for dims, _ in groups for d in dims}
-                for d in e.dim_sizes:
-                    if d not in grouped_dims:
-                        min_possible_total_iters *= sm.all_dim_sizes[d]
+                unlisted = [d for d in e.dim_sizes if d not in grouped_dims]
+                if unlisted:
+                    op_str = f" ({e.operation})" if e.operation else ""
+                    warnings.warn(
+                        f"Einsum {i}{op_str}: dims {unlisted} have no accel_gran entry; "
+                        "treating each as granularity 1 (one element per compute step)")
+                groups = groups + [((d,), 1) for d in unlisted]
 
                 inner_loop_repetitions: List[cp_model.IntVar] = []
                 for gi, (dims, size) in enumerate(groups):
