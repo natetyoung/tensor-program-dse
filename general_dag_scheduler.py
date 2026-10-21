@@ -28,7 +28,7 @@ Internal organisation
 
 import warnings
 from dataclasses import dataclass, field
-from math import isqrt
+from math import isqrt, prod
 from typing import Dict, List, Optional, Tuple
 
 from ortools.sat.python import cp_model
@@ -419,6 +419,33 @@ def _divisors(n: int) -> List[int]:
     return sorted(set(small + [n // d for d in small]))
 
 
+def _dim_product_cap(size: int, perfect_factorization: bool) -> int:
+    """
+    Upper bound, valid for some optimal schedule, on the product of an
+    operand's temporal and parallel factors along one dim of this size, with
+    or without its spatial factor: size under perfect factorization, else
+    2 * size - 2 (1 for size 1).
+
+    Padded case.  For an operand o holding the dim, let P be the product of
+    the factors on o's path and s = ceil(size / P) its tile.  If
+    P * s >= 2 * size - 1, decrement the deepest factor f >= 2 on o's path
+    (one exists: with none, P * s = size).  Every operand p whose tile
+    depends on f is at or below f's node and covers o's tile with its own
+    factors below it, so its P_p * s_p >= P * s.  After the decrement
+    P_p' * s_p >= (2 * size - 1) / 2, so (being an integer) >= size: the old
+    tile still covers the dim, and since the derived tile ceil(size / P_p')
+    is the smallest that does and P_p' < P_p, it is unchanged.  No tile
+    changes, and no cost increases when a factor decreases with tiles fixed.
+    Repeating terminates with P * s <= 2 * size - 2 for every operand.  An
+    operand lacking the dim has a prefix of a descendant's chain, or factors
+    no descendant tiles, which can drop to 1.  Composes with sparse_domains
+    (that reduction only lowers factors, keeping tiles).
+    """
+    if perfect_factorization:
+        return size
+    return max(1, 2 * size - 2)
+
+
 def _build_factor_domains(sm: SchedulerModel, sparse_domains: bool,
                           perfect_factorization: bool) -> None:
     """
@@ -697,7 +724,7 @@ def _build_factor_constraints(sm: SchedulerModel, partial_sums: bool = False) ->
                     model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[o][a])
 
 def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
-                     partial_sums: bool = False) -> None:
+                     partial_sums: bool = False, tight_bounds: bool = False) -> None:
     """
     Build all cost-related variables:
 
@@ -714,9 +741,25 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
     Also adds the dim-fidelity constraints:
       spatial[op][d] * total_temporal[op][d] ≥ dim_size[d]
     using ceiling-division to force the spatial factor up to cover all elements.
+
+    With tight_bounds, products of loop factors are bounded by
+    _dim_product_cap per dim, instead of 4 * size for a single dim and
+    2 * size per dim in products over several dims.
     """
     model = sm.model
     ops = sm.all_operands
+
+    # Upper bounds on products of loop factors: dim_cap[d] along one dim, and
+    # multi_dim_cap[d] per dim in products over several dims.  op_cap[op]
+    # bounds the product over op's allowed dims, and so also its traffic.
+    if tight_bounds:
+        dim_cap = {d: _dim_product_cap(n, perfect_factorization)
+                   for d, n in sm.all_dim_sizes.items()}
+        multi_dim_cap = dim_cap
+    else:
+        dim_cap = {d: 2 * n for d, n in sm.all_dim_sizes.items()}
+        multi_dim_cap = {d: 2 * n for d, n in sm.all_dim_sizes.items()}
+    op_cap = {op: prod(multi_dim_cap[d] for d in sm.op_allowed_temp_dims[op]) for op in ops}
 
     # Spatial cost = product of spatial_dim values for each operand
     for op in ops:
@@ -733,11 +776,6 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
     # Temporal costs
     own_temporal_cost: Dict[str, cp_model.IntVar] = {}  # outputs that may spill partial sums
     for op in ops:
-        allowed_dim_product = 1
-        for d in sm.op_allowed_temp_dims[op]:
-            allowed_dim_product *= sm.all_dim_sizes[d]
-        max_temporal_cost = allowed_dim_product * (2 ** len(sm.op_allowed_temp_dims[op]))
-
         # temporal_dim_contribs[op][other_op][d]: the factor that other_op
         # contributes to op's total temporal iteration count along dim d.
         # It equals other_op's temporal_dim[d] iff other_op is an ancestor of
@@ -781,7 +819,7 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
             sm.total_temporal_dim[op][d] = add_mul_chain(
                 model,
                 [sm.temporal_dim_contribs[op][other_op][d] for other_op in ops],
-                1, sm.all_dim_sizes[d] * 4, # can overshoot via imperfect tiling but not by much
+                1, dim_cap[d],  # can overshoot via imperfect tiling; see _dim_product_cap
                 f'total_temporal_dim_{op}_{d}'
             )
             sm.total_parallel_dim[op][d] = add_mul_chain(
@@ -794,10 +832,10 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
             # Equivalently: spatial[op][d] = ceil(dim_size[d] / (total_temporal[op][d] * total_parallel[op][d]))
             if d in sm.all_operand_dims[op]:
                 total_size = model.NewIntVar(
-                    1, sm.all_dim_sizes[d] * 4,
+                    1, dim_cap[d],
                     f'total_dim_size_{op}_{d}')
                 total_except_spatial = model.NewIntVar(
-                    1, sm.all_dim_sizes[d] * 4,
+                    1, dim_cap[d],
                     f'total_except_spatial_{op}_{d}')
                 model.AddMultiplicationEquality(
                     total_except_spatial, [sm.total_temporal_dim[op][d], sm.total_parallel_dim[op][d]])
@@ -832,7 +870,8 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
             own_temporal_cost[op] = add_mul_chain(
                 model,
                 [sm.total_temporal_dim[op][d] for d in sm.all_operand_dims[op]],
-                1, max_temporal_cost,
+                1, (prod(multi_dim_cap[d] for d in sm.all_operand_dims[op]) if tight_bounds
+                    else op_cap[op]),
                 f'own_temporal_{op}'
             )
             temporal_dims = ([own_temporal_cost[op]]
@@ -840,12 +879,12 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
         sm.temporal_if_not_fused_cost[op] = add_mul_chain(
             model,
             temporal_dims,
-            1, max_temporal_cost,
+            1, op_cap[op],
             f'temporal_if_not_fused_{op}'
         )
 
         # total_temporal_cost is gated by the fusion decision
-        sm.total_temporal_cost[op] = model.NewIntVar(0, max_temporal_cost,
+        sm.total_temporal_cost[op] = model.NewIntVar(0, op_cap[op],
                                                      f'total_temporal_cost_{op}')
         if op in sm.must_write:
             model.Add(sm.total_temporal_cost[op] == 0).OnlyEnforceIf(sm.must_write[op].Not())
@@ -863,13 +902,8 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
         op_size = 1
         for d in sm.all_operand_dims[op]:
             op_size *= sm.all_dim_sizes[d]
-        allowed_dim_product = 1
-        for d in sm.op_allowed_temp_dims[op]:
-            allowed_dim_product *= sm.all_dim_sizes[d]
-
-        max_traffic = allowed_dim_product * (2 ** len(sm.op_allowed_temp_dims[op]))
         traffic = model.NewIntVar(
-            0, max_traffic,
+            0, op_cap[op],
             f'traffic_{op}' if op in own_temporal_cost else f'total_cost_{op}')
         model.AddMultiplicationEquality(
             traffic,
@@ -880,14 +914,14 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
             # first reads the partial sum back.  First writes are the (padded,
             # per-core) output size; without temporal reduction loops outside
             # the buffer they equal the traffic, so fills are zero.
-            first_writes = model.NewIntVar(0, max_traffic, f'first_writes_{op}')
+            first_writes = model.NewIntVar(0, op_cap[op], f'first_writes_{op}')
             model.AddMultiplicationEquality(
                 first_writes, (sm.spatial_cost[op], own_temporal_cost[op]))
-            sm.partial_sum_fills[op] = model.NewIntVar(0, max_traffic, f'partial_sum_fills_{op}')
+            sm.partial_sum_fills[op] = model.NewIntVar(0, op_cap[op], f'partial_sum_fills_{op}')
             model.Add(sm.partial_sum_fills[op] == traffic - first_writes).OnlyEnforceIf(
                 sm.must_write[op])
             model.Add(sm.partial_sum_fills[op] == 0).OnlyEnforceIf(sm.must_write[op].Not())
-            sm.total_cost_vars[op] = model.NewIntVar(0, 2 * max_traffic, f'total_cost_{op}')
+            sm.total_cost_vars[op] = model.NewIntVar(0, 2 * op_cap[op], f'total_cost_{op}')
             model.Add(sm.total_cost_vars[op] == traffic + sm.partial_sum_fills[op])
         else:
             sm.total_cost_vars[op] = traffic
@@ -898,6 +932,43 @@ def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
         elif op in sm.must_read:
             model.Add(sm.total_cost_vars[op] >= op_size // sm.num_cores).OnlyEnforceIf(sm.must_read[op])
             model.Add(sm.total_cost_vars[op] == 0).OnlyEnforceIf(sm.must_read[op].Not())
+
+
+def _build_redundant_bounds(sm: SchedulerModel) -> None:
+    """
+    Add implied constraints that tighten the proven bound without changing
+    the feasible set.
+
+    - Loop counts grow down the tree: if a is an ancestor of b, every loop
+      enclosing a also encloses b, so for each dim both may loop over,
+      b's total temporal and parallel factors are at least a's.
+    - A transferred operand moves at least ceil(op_size / num_cores) elements
+      per core (the existing bound rounds down).  Per-core traffic is at
+      least the product over its dims of ceil(size / parallel factor), and
+      the parallel factors on a path multiply to at most num_cores;
+      partial-sum fills only add to it.
+    """
+    model = sm.model
+    ops = sm.all_operands
+
+    for a in ops:
+        for b in ops:
+            if a == b:
+                continue
+            for d in sm.op_allowed_temp_dims[a]:
+                if d not in sm.op_allowed_temp_dims[b]:
+                    continue
+                model.Add(sm.total_temporal_dim[b][d] >= sm.total_temporal_dim[a][d]).OnlyEnforceIf(
+                    sm.ancestor[a][b])
+                model.Add(sm.total_parallel_dim[b][d] >= sm.total_parallel_dim[a][d]).OnlyEnforceIf(
+                    sm.ancestor[a][b])
+
+    for op in ops:
+        op_size = 1
+        for d in sm.all_operand_dims[op]:
+            op_size *= sm.all_dim_sizes[d]
+        moved = sm.must_write[op] if op in sm.must_write else sm.must_read[op]
+        model.Add(sm.total_cost_vars[op] >= -(-op_size // sm.num_cores)).OnlyEnforceIf(moved)
 
 
 def _build_optimality_constraints(sm: SchedulerModel) -> None:
@@ -1471,6 +1542,8 @@ def scheduler(
     perfect_factorization: bool = False,
     partial_sums: bool = False,
     sparse_domains: bool = False,
+    redundant_bounds: bool = True,
+    tight_bounds: bool = False,
     time_limit: Optional[float] = None,
     seed: Optional[int] = None,
     num_workers: Optional[int] = None,
@@ -1505,6 +1578,21 @@ def scheduler(
                                divisors of the dim size under
                                perfect_factorization, else ceil(size / k).
                                Does not change the optimum.
+    redundant_bounds         : If True, add implied constraints (loop counts
+                               grow down the tree; each transferred operand
+                               moves at least ceil(size / num_cores) per core)
+                               to tighten the proven bound.  Does not change
+                               the optimum.
+    tight_bounds             : If True, bound factor products by
+                               2 * size - 2 per dim (size under
+                               perfect_factorization; see _dim_product_cap)
+                               instead of 4 * size.  Does not change the
+                               optimum.  Faster on most partial_sums +
+                               perfect_factorization cases tested; slower
+                               without partial sums (e.g. the GPT chains),
+                               where an output's traffic domain collapses to
+                               {0, size} and presolve turns those objective
+                               terms into Booleans.
     time_limit / seed / num_workers / linearization_level
                              : CP-SAT parameters (None keeps CP-SAT's
                                default).  Multi-worker search is
@@ -1553,7 +1641,9 @@ def scheduler(
     _build_factor_vars(sm)           # must come before _build_fusion (spatial_dim used there)
     _build_fusion(sm, allow_spilling)
     _build_factor_constraints(sm, partial_sums)  # must come after _build_fusion (uses is_anchor, ancestor)
-    _build_cost_vars(sm, perfect_factorization, partial_sums)  # must come after both factor and fusion phases
+    _build_cost_vars(sm, perfect_factorization, partial_sums, tight_bounds)  # must come after both factor and fusion phases
+    if redundant_bounds:
+        _build_redundant_bounds(sm)  # uses total_*_dim and total_cost_vars from _build_cost_vars
     if enforce_optimal_placement:
         _build_optimality_constraints(sm)
     _build_capacity_constraint(sm)   # uses spatial_cost from _build_cost_vars
@@ -1735,7 +1825,10 @@ if __name__ == '__main__':
     #     ],
     #     8 * 1024 * 1024,
     #     allow_spilling=True,
-    #     perfect_factorization=True
+    #     perfect_factorization=True,
+    #     partial_sums=True,
+    #     sparse_domains=True,
+    #     tight_bounds=True,
     # )
     # def generate_matmul_chain(num_einsums, m, k_n_seq):
     #     ret = []
@@ -1759,10 +1852,13 @@ if __name__ == '__main__':
     # #     generate_matmul_chain(2, 32*1024, [(4*1024, 16*1024), (16*1024, 4*1024)]),
     # #     512 * 1024
     # # )
-    # print(generate_matmul_chain(8, 8*1024, [(16*1024, 16*1024), (16*1024, 4*1024), (4*1024, 4*1024), (4*1024, 16*1024)]))
+    # # print(generate_matmul_chain(8, 8*1024, [(16*1024, 16*1024), (16*1024, 4*1024), (4*1024, 4*1024), (4*1024, 16*1024)]))
     # scheduler(
     #     generate_matmul_chain(8, 8*1024, [(16*1024, 16*1024), (16*1024, 4*1024), (4*1024, 4*1024), (4*1024, 16*1024)]),
     #     512 * 1024,
     #     allow_spilling=True,
-    #     perfect_factorization=True
+    #     perfect_factorization=True,
+    #     partial_sums=True,
+    #     sparse_domains=True,
+    #     tight_bounds=True,
     # )
