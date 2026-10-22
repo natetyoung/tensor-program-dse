@@ -399,14 +399,14 @@ def kda_core_decode_einsums(d_k=128, d_v=128, heads=96):
             },
             output_operand='1bkkas',
             dim_sizes={'h': heads, 'd_k0': d_k, 'd_k1': d_k, 'd_v': d_v},
-            accel_gran={'d_k0': 128, 'd_k1': 128, 'd_v': 128, 'h': 1},
+            accel_gran={'d_k0': 128, 'd_k1': 128, 'd_v': 512, 'h': 1},
             compute_cost=70710,
             operation='matmul'
         ),
         Einsum(
             operand_dims={
                 'bk': ('d_k0', 'h'),
-                'v_T': ('d_v', 'h'),
+                'v': ('d_v', 'h'),
                 'bkv': ('d_k0', 'd_v', 'h')
             },
             output_operand='bkv',
@@ -439,26 +439,26 @@ def lcan_einsums(name, hidden=7168, d_out=128, d_out_name='d_k', heads=96, norm=
             },
             output_operand=name+'_lin_out',
             dim_sizes={'hidden': hidden, d_out_name: d_out, 'h': heads},
-            accel_gran={'hidden': 128, d_out_name: 128, 'h': 1},
-            compute_cost=70710,
-            operation='matmul'
+            accel_gran={'hidden': 128, (d_out_name, 'h'): 128},
+            compute_cost=4481,
+            operation='matvec'
         ),
         Einsum(
             operand_dims={
                 name+'_history': (d_out_name, 'h', 'hist'),
-                name+'_conv_w': (d_out_name, 'hist'),
+                name+'_conv_w': (d_out_name, 'h', 'hist'),
                 name+'_partial_conv': (d_out_name, 'h')
             },
             output_operand=name+'_partial_conv',
             dim_sizes={'hist': 3, d_out_name: d_out, 'h': heads},
             accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='matmul'
+            compute_cost=44,
+            operation='batched_dotproduct'
         ),
         Einsum(
             operand_dims={
                 name+'_lin_out': (d_out_name, 'h'),
-                name+'_conv_w_0': (d_out_name,),
+                name+'_conv_w_0': (d_out_name, 'h'),
                 name+'_lin_out_scaled': (d_out_name, 'h')
             },
             output_operand=name+'_lin_out_scaled',
@@ -471,24 +471,13 @@ def lcan_einsums(name, hidden=7168, d_out=128, d_out_name='d_k', heads=96, norm=
             operand_dims={
                 name+'_lin_out_scaled': (d_out_name, 'h'),
                 name+'_partial_conv': (d_out_name, 'h'),
-                name+'_conv_out': (d_out_name, 'h')
-            },
-            output_operand=name+'_conv_out',
-            dim_sizes={d_out_name: d_out, 'h': heads},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='elew_add'
-        ),
-        Einsum(
-            operand_dims={
-                name+'_conv_out': (d_out_name, 'h'),
                 name+'_act_out' if norm else name: (d_out_name, 'h')
             },
             output_operand=name+'_act_out' if norm else name,
             dim_sizes={d_out_name: d_out, 'h': heads},
             accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='silu'
+            compute_cost=44,
+            operation='silu(elew_add)'
         )
     ]
     if norm:
@@ -538,52 +527,76 @@ def kda_full_decode_einsums(hidden=7168, d_k=128, d_v=128, heads=96, a_rank=128)
         Einsum(
             operand_dims={
                 'hidden': ('hidden',),
-                'W_a_down': ('hidden', 'a_rank', 'h'),
-                'a_down': ('a_rank', 'h')
+                'W_a_down': ('hidden', 'a_rank'),
+                'a_down': ('a_rank',)
             },
             output_operand='a_down',
-            dim_sizes={'hidden': hidden, 'a_rank': a_rank, 'h': heads},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=22,
+            dim_sizes={'hidden': hidden, 'a_rank': a_rank},
+            accel_gran={'hidden': 128, 'a_rank': 128},
+            compute_cost=4481,
             operation='matvec'
         ),
         Einsum(
             operand_dims={
                 'a_down': ('a_rank',),
                 'W_a_up': ('a_rank', 'd_k1', 'h'),
+                'a_inter': ('d_k1', 'h')
+            },
+            output_operand='a_inter',
+            dim_sizes={'a_rank': a_rank, 'h': heads, 'd_k1': d_k},
+            accel_gran={'a_rank': 128, ('d_k1', 'h'): 128},
+            compute_cost=4481,
+            operation='matvec'
+        ),
+        Einsum(
+            operand_dims={
+                'a_inter': ('d_k1', 'h'),
+                'exp_alog': ('h',),
+                'dt_bias': ('d_k1', 'h'),
                 'a': ('d_k1', 'h')
             },
             output_operand='a',
-            dim_sizes={'a_rank': a_rank, 'h': heads, 'd_k1': d_k},
+            dim_sizes={'d_k1': d_k, 'h': heads},
             accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='sigmoid(matvec)'
+            compute_cost=110,
+            operation='exp(-5*sigmoid(exp_alog*(a_inter+dt_bias)))'
         ),
         Einsum(
             operand_dims={
                 'hidden': ('hidden',),
                 'W_b_down': ('hidden', 'h'),
+                'b_inter': ('h',)
+            },
+            output_operand='b_inter',
+            dim_sizes={'hidden': hidden, 'h': heads},
+            accel_gran={'hidden': 128, 'h': 128},
+            compute_cost=4481,
+            operation='matvec'
+        ),
+        Einsum(
+            operand_dims={
+                'b_inter': ('h',),
                 'b': ('h',)
             },
             output_operand='b',
-            dim_sizes={'hidden': hidden, 'h': heads},
+            dim_sizes={'h': heads},
             accel_gran={'PRODUCT': 128},
             compute_cost=22,
-            operation='sigmoid(matvec)'
+            operation='sigmoid'
         )
     ]
     einsums += kda_core_decode_einsums(d_k=d_k, d_v=d_v, heads=heads)
     einsums += [ # S_{t-1}q -> RMSNorm
         Einsum(
             operand_dims={
-                'S_{t-1}': ('d_k1', 'd_v', 'h'),
+                'S_t': ('d_k1', 'd_v', 'h'),
                 'q': ('d_k1', 'h'),
                 'o': ('d_v', 'h')
             },
             output_operand='o',
             dim_sizes={'d_k1': d_k, 'd_v': d_v, 'h': heads},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=22,
+            accel_gran={'d_k1': 128, 'd_v': 128, 'h': 1},
+            compute_cost=4481,
             operation='matvec'
         ),
         Einsum(
@@ -596,56 +609,48 @@ def kda_full_decode_einsums(hidden=7168, d_k=128, d_v=128, heads=96, a_rank=128)
             accel_gran={'PRODUCT': 128},
             compute_cost=22,
             operation='rmsnorm'
-        ),
-        Einsum(
-            operand_dims={
-                'o': ('d_v', 'h'),
-                'computed_o_rmsnorm': ('h',),
-                'o_normed': ('d_v', 'h')
-            },
-            output_operand='o_normed',
-            dim_sizes={'d_v': d_v, 'h': heads},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='rmsnorm_divide'
-        )       
+        )
     ]
     einsums += [ # bypass
         Einsum(
             operand_dims={
                 'hidden': ('hidden',),
-                'W_g_down': ('hidden', 'a_rank', 'h'),
-                'g_down': ('a_rank', 'h')
+                'W_g': ('hidden', 'd_v', 'h'),
+                'g_inter': ('d_v', 'h')
             },
-            output_operand='g_down',
-            dim_sizes={'hidden': hidden, 'a_rank': a_rank, 'h': heads},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=22,
+            output_operand='g_inter',
+            dim_sizes={'hidden': hidden, 'h': heads, 'd_v': d_v},
+            accel_gran={'hidden': 128, ('d_v', 'h'): 128},
+            compute_cost=4481,
             operation='matvec'
-        ),
+        )
+    ]
+    einsums += [ # final output
         Einsum(
             operand_dims={
-                'g_down': ('a_rank',),
-                'W_g_up': ('a_rank', 'd_v', 'h'),
-                'g': ('d_v', 'h')
-            },
-            output_operand='g',
-            dim_sizes={'a_rank': a_rank, 'h': heads, 'd_v': d_v},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='sigmoid(matvec)'
-        ),
-        Einsum(
-            operand_dims={
-                'o_normed': ('d_v', 'h'),
-                'g': ('d_v', 'h'),
+                'o': ('d_v', 'h'),
+                'computed_o_rmsnorm': ('h',),
+                'norm_weight': ('d_v',),
+                'g_inter': ('d_v', 'h'),
                 'o_bypassed': ('d_v', 'h')
             },
             output_operand='o_bypassed',
             dim_sizes={'d_v': d_v, 'h': heads},
             accel_gran={'PRODUCT': 128},
             compute_cost=22,
-            operation='elew_mul'
+            operation='o / computed_o_rmsnorm * norm_weight * sigmoid(g_inter)'
+        ),
+        Einsum(
+            operand_dims={
+                'o_bypassed': ('d_v', 'h'),
+                'W_out': ('d_v', 'h', 'out_hidden'),
+                'out': ('out_hidden',)
+            },
+            output_operand='out',
+            dim_sizes={'d_v': d_v, 'h': heads, 'out_hidden': hidden},
+            accel_gran={('d_v', 'h'): 128, 'out_hidden': 128},
+            compute_cost=4481,
+            operation='matvec'
         )
     ]
     return einsums
@@ -715,4 +720,13 @@ if __name__ == '__main__':
     # print("=========================================")
     # print("Running Test Case 9: KDA Full Decode")
     # print("=========================================")
-    # scheduler(kda_full_decode_einsums(hidden=7168, d_k=128, d_v=128, heads=96, a_rank=128), capacity=3 * 1024 * 1024, allow_spilling=True)
+    # scheduler(
+    #     kda_full_decode_einsums(hidden=7168, d_k=128, d_v=128, heads=96, a_rank=128),
+    #     capacity=3 * 1024 * 1024,
+    #     num_cores=1,
+    #     allow_spilling=True,
+    #     perfect_factorization=True,
+    #     sparse_domains=True,
+    #     tight_bounds=True,
+    #     global_outputs=('S_t', 'k_lin_out', 'q_lin_out', 'v_lin_out', 'out')
+    # )
