@@ -29,7 +29,7 @@ Internal organisation
 import warnings
 from dataclasses import dataclass, field
 from math import isqrt, prod
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from ortools.sat.python import cp_model
 
@@ -517,7 +517,8 @@ def _build_factor_vars(sm: SchedulerModel) -> None:
     }
 
 
-def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
+def _build_fusion(sm: SchedulerModel, allow_spilling: bool,
+                  global_outputs: Set[str] = frozenset()) -> None:
     """
     Create must_write / must_read / fused variables and their defining
     constraints.
@@ -526,6 +527,9 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
     adjacent occurrence of the same original operand.  Fusion requires the two
     occurrences to be in the same node and to have effectively-identical time intervals.
     Fused operands must share spatial factors along shared dimensions.
+
+    Producers of operands in global_outputs (original names) are always
+    written, even if every consumer is fused.
     """
     model = sm.model
     ops = sm.all_operands
@@ -564,8 +568,8 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
         consumers = sm.operand_groups[orig]["consumers"]
 
         if op in sm.must_write:
-            if len(consumers) == 0:
-                # No consumers: this is a global output, must always be stored.
+            if len(consumers) == 0 or orig in global_outputs:
+                # Global output: must always be stored, regardless of fusion.
                 model.Add(sm.must_write[op] == 1)
             else:
                 # must_write iff at least one consumer must_read
@@ -574,9 +578,9 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
                 model.AddBoolOr(
                     [sm.must_read[consumer] for consumer in consumers]
                 ).OnlyEnforceIf(sm.must_write[op])
-                # Consumers which must read are sequenced after the producer
-                for consumer in consumers:
-                    model.Add(sm.totally_after[consumer][op] == 1).OnlyEnforceIf(sm.must_read[consumer])
+            # Consumers which must read are sequenced after the producer
+            for consumer in consumers:
+                model.Add(sm.totally_after[consumer][op] == 1).OnlyEnforceIf(sm.must_read[consumer])
 
         if op in sm.must_read:
             possibly_fused_predecessors = [i for i in sm.fused if op in sm.fused[i]]
@@ -627,7 +631,8 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool) -> None:
 
     if not allow_spilling:
         for op in sm.must_write:
-            if len(sm.operand_groups[sm.original_names[op]]["consumers"]) > 0:
+            orig = sm.original_names[op]
+            if len(sm.operand_groups[orig]["consumers"]) > 0 and orig not in global_outputs:
                 model.Add(sm.must_write[op] == 0)
 
 
@@ -1432,7 +1437,7 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
             events = []
             for op in n:
                 events.append((solver.Value(sm.time_start[op]), 0, fused_depth(op), 'init', op))
-                events.append((solver.Value(sm.time_end[op]),   2, 0, 'free', op))
+                events.append((solver.Value(sm.time_end[op]),   2, fused_depth(op), 'free', op))
             for c in children[n]:
                 events.append((node_start_time(c), 1, 0, 'child', c))
             for ev in compute_events[n]:
@@ -1492,9 +1497,12 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
                     is_write = op in sm.must_write and solver.Value(sm.must_write[op])
                     has_fused_consumer = any(
                         solver.Value(sm.fused[op][c]) for c in sm.fused.get(op, {}))
+                    # must_write means some consumer reads from memory, so the
+                    # store is needed even if another consumer is fused.  The
+                    # buffer itself is only freed at the end of the fusion chain.
+                    if is_write:
+                        print(f"{inner_indent}store({orig}) = {op}")
                     if not has_fused_consumer:
-                        if is_write:
-                            print(f"{inner_indent}store({orig}) = {op}")
                         print(f"{inner_indent}free({op}) # time {t}")
 
                 elif ev_type == 'child':
@@ -1547,7 +1555,8 @@ def scheduler(
     time_limit: Optional[float] = None,
     seed: Optional[int] = None,
     num_workers: Optional[int] = None,
-    linearization_level: Optional[int] = None
+    linearization_level: Optional[int] = None,
+    global_outputs: Iterable[str] = ()
 ) -> Tuple['SchedulerModel', cp_model.CpSolver]:
     """
     Synthesize a schedule-tree / loop-tree structure for a DAG of einsums.
@@ -1598,6 +1607,11 @@ def scheduler(
                                default).  Multi-worker search is
                                nondeterministic; fix seed and num_workers to
                                compare runs.
+    global_outputs           : Original names of einsum outputs that must be
+                               stored to off-chip memory even though they are
+                               consumed by later einsums (and possibly fused
+                               into them).  Outputs with no consumers are
+                               always stored and need not be listed.
 
     Returns
     ───────
@@ -1607,6 +1621,11 @@ def scheduler(
     """
     # ── Step 1: Pre-process ───────────────────────────────────────────────────
     dag = uniquify_einsums(einsums, partial_sums)
+    global_outputs = set(global_outputs)
+    for name in global_outputs:
+        if name not in dag.operand_groups or dag.operand_groups[name]["producer"] is None:
+            raise ValueError(
+                f"global_outputs entry '{name}' is not the output of any Einsum.")
 
     if debug:
         print("Operand Name Uniquification Results:")
@@ -1639,7 +1658,7 @@ def scheduler(
     _build_timeline(sm)
     _build_factor_domains(sm, sparse_domains, perfect_factorization)
     _build_factor_vars(sm)           # must come before _build_fusion (spatial_dim used there)
-    _build_fusion(sm, allow_spilling)
+    _build_fusion(sm, allow_spilling, global_outputs)
     _build_factor_constraints(sm, partial_sums)  # must come after _build_fusion (uses is_anchor, ancestor)
     _build_cost_vars(sm, perfect_factorization, partial_sums, tight_bounds)  # must come after both factor and fusion phases
     if redundant_bounds:
