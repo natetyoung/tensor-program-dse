@@ -1088,6 +1088,18 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
                         [sm.ancestor[op1][op2].Not(), sm.ancestor[op2][op1].Not()]
                     ).OnlyEnforceIf(*no_fusion_conds)
 
+    # No unnecessary branches: anchor nodes must have a factor > 1 if they have any ancestors
+    for op in ops:
+        sum_of_dims = sum(
+            [sm.temporal_dim[op][dim] for dim in sm.op_allowed_temp_dims[op]] +
+            [sm.parallel_dim[op][dim] for dim in sm.op_allowed_temp_dims[op]]
+        )
+        for op_anc in ops:
+            if op_anc == op:
+                continue
+            model.Add(sum_of_dims > 2 * len(sm.op_allowed_temp_dims)).OnlyEnforceIf(
+                sm.is_anchor[op], sm.ancestor[op_anc][op], sm.ancestor[op][op_anc].Not()
+            )
 
 def _build_capacity_constraint(sm: SchedulerModel) -> None:
     """
