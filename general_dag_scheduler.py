@@ -166,6 +166,7 @@ class SchedulerModel:
     all_dim_sizes: Dict[str, int]
     capacity: int
     num_cores: int
+    codesign_costs: Optional[Tuple[int]] = None
 
     # ── Tree-structure variables (_build_tree_structure) ──────────────────────
     # ancestor[i][j]: the node containing i is a (non-strict) ancestor of the node containing j
@@ -233,6 +234,8 @@ class SchedulerModel:
     all_compute_iters: List = field(default_factory=list)
     final_compute_cost: Optional[cp_model.IntVar] = None
     final_communication_cost: Optional[cp_model.IntVar] = None
+    chosen_capacity: Optional[cp_model.IntVar] = None
+    compute_area: Optional[cp_model.IntVar] = None
 
 
 # ─── 3. Model-building helpers ────────────────────────────────────────────────
@@ -1126,7 +1129,12 @@ def _build_capacity_constraint(sm: SchedulerModel) -> None:
             model.Add(active_cost >= sm.spatial_cost[j]).OnlyEnforceIf(live_conds)
             active_costs.append(active_cost)
 
-        model.Add(sum(active_costs) <= sm.capacity)
+        if sm.codesign_costs is not None:
+            # create capacity variable
+            sm.chosen_capacity = model.NewIntVar(0, sm.capacity, f'chosen_capacity')
+            model.Add(sum(active_costs) <= sm.chosen_capacity)
+        else:
+            model.Add(sum(active_costs) <= sm.capacity)
 
 
 def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
@@ -1172,7 +1180,7 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
 
                 spatial_product = add_mul_chain(
                     model, min_spatial_dims,
-                    1, sm.capacity * len(e.dim_sizes),
+                    1, prod(sm.all_dim_sizes[d] for d in e.dim_sizes),
                     f'spatial_dim_product_{i}'
                 )
                 total_repetitions = model.NewIntVar(
@@ -1260,19 +1268,50 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
     sm.final_communication_cost = model.NewIntVar(min_communication_cost, max_communication_cost, 'final_communication_cost')
     model.Add(sm.final_communication_cost == sum(sm.total_cost_vars[op] for op in ops))
 
-    final_cost = model.NewIntVar(
-        max(min_compute_cost, min_communication_cost),
-        max(max_compute_cost, max_communication_cost), 
-        'final_cost'
-    )
-    model.Add(
-        final_cost >= sm.final_compute_cost
-    )
-    model.Add(
-        final_cost >= sm.final_communication_cost
-    )
+    if sm.codesign_costs is None:
+        final_cost = model.NewIntVar(
+            max(min_compute_cost, min_communication_cost),
+            max(max_compute_cost, max_communication_cost), 
+            'final_cost'
+        )
+        model.Add(
+            final_cost >= sm.final_compute_cost
+        )
+        model.Add(
+            final_cost >= sm.final_communication_cost
+        )
 
-    model.Minimize(final_cost*5 + sm.final_compute_cost + sm.final_communication_cost)
+        model.Minimize(final_cost*5 + sm.final_compute_cost + sm.final_communication_cost)
+
+    else:
+        # minimize max(accesses, compute*bandwidth*mac_area/(area-capacity*sram_area))
+        total_compute = sum(prod(sm.all_dim_sizes[d] for d in e.dim_sizes) for e in sm.einsums)
+        print("TOTAL COMPUTE:", total_compute)
+        compute_cost_at_full = total_compute // (sm.codesign_costs[3] // sm.codesign_costs[1] - 1) + 1
+        final_cost = model.NewIntVar(
+            min_communication_cost,
+            max(max_communication_cost, compute_cost_at_full),
+            'final_codesign_cost'
+        )
+        sm.final_compute_cost = model.NewIntVar(
+            total_compute // (sm.codesign_costs[3] // sm.codesign_costs[1] + 1) - 1,
+            total_compute,
+            'final_codesign_compute_cost'
+        )
+        print("COMPUTE COST AT FULL:", compute_cost_at_full)
+        sm.compute_area = model.NewIntVar(sm.codesign_costs[1], sm.codesign_costs[3], 'compute_area')
+        model.Add(sm.compute_area == (sm.codesign_costs[3] - sm.codesign_costs[2]*sm.chosen_capacity))
+        model.AddDivisionEquality(
+            sm.final_compute_cost,
+            total_compute * sm.codesign_costs[1],
+            sm.compute_area
+        )
+        print("NUMERATOR:", total_compute * sm.codesign_costs[1])
+
+        model.Add(final_cost >= sm.final_compute_cost * sm.codesign_costs[0])
+        model.Add(final_cost >= sm.final_communication_cost)
+
+        model.Minimize(final_cost)
 
 
 # ─── 4. Result extraction and printing ───────────────────────────────────────
@@ -1530,12 +1569,16 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
             f"(spatial {solver.Value(sm.spatial_cost[op])}, "
             f"temporal {solver.Value(sm.total_temporal_cost[op])}{fills})"
         )
-    if solver.Value(sm.final_compute_cost) > solver.Value(sm.final_communication_cost):
-        print(f"Final cost = {solver.Value(sm.final_compute_cost)} (compute dominated vs {solver.Value(sm.final_communication_cost)})")
-    elif solver.Value(sm.final_compute_cost) < solver.Value(sm.final_communication_cost):
-        print(f"Final cost = {solver.Value(sm.final_communication_cost)} (communication dominated vs {solver.Value(sm.final_compute_cost)})")
+    if sm.codesign_costs is None:
+        if solver.Value(sm.final_compute_cost) > solver.Value(sm.final_communication_cost):
+            print(f"Final cost = {solver.Value(sm.final_compute_cost)} (compute dominated vs {solver.Value(sm.final_communication_cost)})")
+        elif solver.Value(sm.final_compute_cost) < solver.Value(sm.final_communication_cost):
+            print(f"Final cost = {solver.Value(sm.final_communication_cost)} (communication dominated vs {solver.Value(sm.final_compute_cost)})")
+        else:
+            print(f"Final cost = {solver.Value(sm.final_compute_cost)} (compute and communication equal)")
     else:
-        print(f"Final cost = {solver.Value(sm.final_compute_cost)} (compute and communication equal)")
+        print(f"Chosen capacity = {solver.Value(sm.chosen_capacity)}, buffer area ratio = {solver.Value(sm.chosen_capacity) * sm.codesign_costs[2] / sm.codesign_costs[3]:.3f}")
+        print(f"Compute area = {solver.Value(sm.compute_area)}, compute cost = {solver.Value(sm.final_compute_cost)}, communication cost = {solver.Value(sm.final_communication_cost)}")
 
 
 # ─── 5. Orchestrator ─────────────────────────────────────────────────────────
@@ -1556,7 +1599,8 @@ def scheduler(
     seed: Optional[int] = None,
     num_workers: Optional[int] = None,
     linearization_level: Optional[int] = None,
-    global_outputs: Iterable[str] = ()
+    global_outputs: Iterable[str] = (),
+    codesign_costs: Optional[Tuple[int]] = None
 ) -> Tuple['SchedulerModel', cp_model.CpSolver]:
     """
     Synthesize a schedule-tree / loop-tree structure for a DAG of einsums.
@@ -1612,6 +1656,12 @@ def scheduler(
                                consumed by later einsums (and possibly fused
                                into them).  Outputs with no consumers are
                                always stored and need not be listed.
+    codesign_costs           : Optional tuple of (bandwidth, mac_area, 
+                                                  sram_area, area_budget)
+                               if not None, the scheduler will use these values
+                               for "codesign mode", and ignore capacity, instead
+                               choosing optimal capacity to minimize final delay
+                               subject to area budget.
 
     Returns
     ───────
@@ -1640,6 +1690,15 @@ def scheduler(
         print()
 
     # ── Step 2: Create model context ──────────────────────────────────────────
+    if codesign_costs is not None:
+        if len(codesign_costs) != 4:
+            raise ValueError("codesign_costs must be a tuple of (bandwidth, mac_area, sram_area, area_budget)")
+        if capacity is not None:
+            warnings.warn("capacity parameter is ignored in codesign mode")
+        if num_cores is not None:
+            warnings.warn("num_cores parameter is ignored in codesign mode")
+        # set capacity to max usable or useful
+        capacity = min(codesign_costs[3] // codesign_costs[2], sum(prod(dag.all_dim_sizes[d] for d in dag.all_operand_dims[op]) for op in dag.all_operands))
     sm = SchedulerModel(
         model=cp_model.CpModel(),
         einsums=dag.einsums,
@@ -1650,7 +1709,8 @@ def scheduler(
         op_allowed_temp_dims=dag.op_allowed_temp_dims,
         all_dim_sizes=dag.all_dim_sizes,
         capacity=capacity,
-        num_cores=num_cores
+        num_cores=num_cores,
+        codesign_costs=codesign_costs
     )
 
     # ── Step 3: Build model phases in dependency order ────────────────────────
@@ -1848,6 +1908,7 @@ if __name__ == '__main__':
     #     partial_sums=True,
     #     sparse_domains=True,
     #     tight_bounds=True,
+    #     codesign_costs=((149 * 1024 * 1024 * 1024) // (700 * 1000 * 1000), int(332.25 * 4), int(2.59 * 4), int(432.2 * 1000 * 1000 * 4))
     # )
     # def generate_matmul_chain(num_einsums, m, k_n_seq):
     #     ret = []
