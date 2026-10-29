@@ -989,12 +989,10 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
       operand (and no same-node operand) are forced to 1.
     - Spatial factors for a dimension are bounded by the maximum accelerator
       granularity for that dimension across all einsums.
-    - Temporal factors are similarly bounded when all strict ancestors of an
-      operand share that dimension.
     - Different occurrences of the same original operand must not be strict 
       ancestors of each other.
-    - When there is no fusion at all, operands belonging to different einsums 
-      must not be in an ancestor relationship.
+    - Operands belonging to different einsums must not be in an ancestor
+      relationship unless the einsums are connected by a path of fusions.
     """
     model = sm.model
     ops = sm.all_operands
@@ -1032,36 +1030,6 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
                 model.Add(sm.spatial_dim[op][dim] <= max_useful_granularity[dim]).OnlyEnforceIf(
                     *([sm.ancestor[op][other].Not() for other in non_users]))
 
-    # Bound temporal factors when all strict ancestors share the dimension.
-    for c in ops:
-        c_has_strict_anc = model.NewBoolVar(f'{c}_has_strict_anc')
-        is_strict_anc: Dict[str, cp_model.IntVar] = {}
-        for a in ops:
-            if a == c:
-                continue
-            var = model.NewBoolVar(f'{a}_is_strict_anc_of_{c}')
-            model.AddBoolAnd([sm.ancestor[a][c], sm.ancestor[c][a].Not()]).OnlyEnforceIf(var)
-            model.AddBoolOr([sm.ancestor[a][c].Not(), sm.ancestor[c][a]]).OnlyEnforceIf(var.Not())
-            is_strict_anc[a] = var
-
-        model.AddBoolOr(list(is_strict_anc.values())).OnlyEnforceIf(c_has_strict_anc)
-        model.AddBoolAnd([v.Not() for v in is_strict_anc.values()]).OnlyEnforceIf(
-            c_has_strict_anc.Not())
-
-        for dim in sm.op_allowed_temp_dims[c]:
-            bad_bs = [b for b in ops if dim not in sm.all_operand_dims[b] and b != c]
-            bad_b_exists = model.NewBoolVar(f'bad_b_exists_{c}_{dim}')
-            if not bad_bs:
-                model.Add(bad_b_exists == 0)
-            else:
-                model.AddBoolOr([is_strict_anc[b] for b in bad_bs]).OnlyEnforceIf(bad_b_exists)
-                model.AddBoolAnd(
-                    [is_strict_anc[b].Not() for b in bad_bs]
-                ).OnlyEnforceIf(bad_b_exists.Not())
-            model.Add(
-                sm.temporal_dim[c][dim] <= max_useful_granularity[dim]
-            ).OnlyEnforceIf([c_has_strict_anc, bad_b_exists.Not()])
-
     # No strict ancestorship between different occurrences of the
     # same original operand.
     for e in sm.einsums:
@@ -1097,7 +1065,7 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
         for op_anc in ops:
             if op_anc == op:
                 continue
-            model.Add(sum_of_dims > 2 * len(sm.op_allowed_temp_dims)).OnlyEnforceIf(
+            model.Add(sum_of_dims > 2 * len(sm.op_allowed_temp_dims[op])).OnlyEnforceIf(
                 sm.is_anchor[op], sm.ancestor[op_anc][op], sm.ancestor[op][op_anc].Not()
             )
 
@@ -1953,4 +1921,22 @@ if __name__ == '__main__':
     #     partial_sums=True,
     #     sparse_domains=True,
     #     tight_bounds=True,
+    # )
+    # scheduler(
+    #     [
+    #         Einsum(operand_dims={'I': ('m', 'nI'), 'WA': ('nI', 'nA'), 'A': ('m', 'nA')}, output_operand='A', dim_sizes={'m': 4096, 'nA': 1024, 'nI': 1024}, accel_gran=None, compute_cost=0, operation='MatmulA'),
+    #         Einsum(operand_dims={'A': ('m', 'nA'), 'WB': ('nA', 'nB'), 'B': ('m', 'nB')}, output_operand='B', dim_sizes={'m': 4096, 'nA': 1024, 'nB': 1024}, accel_gran=None, compute_cost=0, operation='MatmulB'),
+    #         Einsum(operand_dims={'B': ('m', 'nB'), 'WC': ('nB', 'nC'), 'C': ('m', 'nC')}, output_operand='C', dim_sizes={'m': 4096, 'nB': 1024, 'nC': 1024}, accel_gran=None, compute_cost=0, operation='MatmulC'),
+    #         Einsum(operand_dims={'C': ('m', 'nC'), 'WD': ('nC', 'nD'), 'D': ('m', 'nD')}, output_operand='D', dim_sizes={'m': 4096, 'nC': 1024, 'nD': 1024}, accel_gran=None, compute_cost=0, operation='MatmulD'),
+    #         Einsum(operand_dims={'D': ('m', 'nD'), 'WE': ('nD', 'nE'), 'E': ('m', 'nE')}, output_operand='E', dim_sizes={'m': 4096, 'nD': 1024, 'nE': 1024}, accel_gran=None, compute_cost=0, operation='MatmulE'),
+    #         Einsum(operand_dims={'E': ('m', 'nE'), 'WF': ('nE', 'nF'), 'F': ('m', 'nF')}, output_operand='F', dim_sizes={'m': 4096, 'nE': 1024, 'nF': 1024}, accel_gran=None, compute_cost=0, operation='MatmulF'),
+    #         Einsum(operand_dims={'F': ('m', 'nF'), 'WG': ('nF', 'nG'), 'G': ('m', 'nG')}, output_operand='G', dim_sizes={'m': 4096, 'nF': 1024, 'nG': 1024}, accel_gran=None, compute_cost=0, operation='MatmulG'),
+    #         Einsum(operand_dims={'G': ('m', 'nG'), 'WH': ('nG', 'nH'), 'H': ('m', 'nH')}, output_operand='H', dim_sizes={'m': 4096, 'nG': 1024, 'nH': 1024}, accel_gran=None, compute_cost=0, operation='MatmulH')
+    #     ],
+    #     256 * 1024,
+    #     allow_spilling=True,
+    #     perfect_factorization=True,
+    #     partial_sums=True,
+    #     sparse_domains=True,
+    #     tight_bounds=True
     # )
