@@ -4,11 +4,13 @@ from typing import Dict, FrozenSet, List, NamedTuple, Tuple, Union
 from ortools.sat.python import cp_model
 
 class MemCosts(NamedTuple):
-    '''Integer per-element access costs of one memory.'''
+    '''Integer per-element access costs of one memory. shared_port: reads
+    and writes share one port (their times add) instead of separate ones.'''
     read_energy: int = 1
     write_energy: int = 1
     read_time: int = 1
     write_time: int = 1
+    shared_port: bool = False
 
 class Memory(NamedTuple):
     cap: int
@@ -22,8 +24,12 @@ class Unit(NamedTuple):
 
 MemKey = Tuple[int, int]  # (level, memory index); DRAM is (num_levels, 0)
 
-DELAY_CAP = 2**61  # largest compute port modeled; CP-SAT needs bounds <= int64max / 2
-ENERGY_CAP = 2**61  # bound on modeled energy, for the same reason (split over memories)
+# CP-SAT needs every bound <= int64max / 2 and the sum of all domain sizes to
+# fit in an int64. The variables bounded by these caps (delay, compute port,
+# energy and its per-memory shares, scaled EDP <= 2^60) dominate that sum, so
+# each cap is 2^59, leaving room for the rest.
+DELAY_CAP = 2**59  # largest compute port modeled
+ENERGY_CAP = 2**59  # bound on modeled energy (split over memories)
 
 class Problem(NamedTuple):
     '''Parsed inputs plus derived structure, shared by model and evaluator.'''
@@ -166,7 +172,8 @@ def evaluate_schedule(p:Problem, order, factors, par_rows):
     per bucket (len(order) + 1). par_rows: level -> per array dim
     {dim: parallel factor}. Returns dict with per-unit 'spatial' (tile per
     instance) and 'traffic' (elements moved, summed over instances), and
-    'energy', 'delay', 'ports' ((memory, 'read'/'write') -> time per instance).
+    'energy', 'delay', 'ports' ((memory, 'read'/'write', or 'read/write' if
+    shared_port) -> time per instance).
     '''
     num_levels = len(p.memories)
     iters = prod(p.dim_sizes.values())
@@ -235,9 +242,12 @@ def evaluate_schedule(p:Problem, order, factors, par_rows):
               + sum(p.mem_costs[k].write_energy * n for k, n in writes.items())
               + p.compute_energy * iters)
     ports = {}
-    for k in p.mem_costs:
-        ports[(k, 'read')] = -(-p.mem_costs[k].read_time * reads[k] // instances[k[0]])
-        ports[(k, 'write')] = -(-p.mem_costs[k].write_time * writes[k] // instances[k[0]])
+    for k, c in p.mem_costs.items():
+        busy = {'read': c.read_time * reads[k], 'write': c.write_time * writes[k]}
+        if c.shared_port:
+            busy = {'read/write': busy['read'] + busy['write']}
+        for kind, t in busy.items():
+            ports[(k, kind)] = -(-t // instances[k[0]])
     delay = max(ports.values(), default=0)
     if p.compute_time > 0:
         delay = max(delay, p.compute_time * -(-iters // instances[0]))
@@ -371,7 +381,8 @@ def cb_einsum_ml(
       splits the level into separate memories. An operand in no memory at a
       level bypasses it. DRAM sits above the outermost level.
     - level_costs / dram_costs: MemCosts for memories without explicit costs,
-      and for DRAM.
+      and for DRAM. MemCosts.shared_port puts a memory's reads and writes on
+      one port.
     - objective: 'edp' (energy x delay, each scaled below 2^30 to avoid
       overflow), 'energy' or 'delay'.
     - fanouts[l]: replicates level l (its memories and the compute below)
@@ -423,8 +434,9 @@ def cb_einsum_ml(
     parent and written to l, the output the reverse (plus, with
     partial_sums, the fills read back from the parent). Energy is the sum of
     read_energy + write_energy over every access. Delay is the busiest port:
-    every memory has separate read and write ports running in parallel,
-    each busy for elements x its time, split over the memory's instances.
+    every memory has separate read and write ports running in parallel (one
+    shared port with shared_port), each busy for elements x its time, split
+    over the memory's instances.
     Capacities are per instance; traffic and energy sum over instances.
     Padding is ignored for compute.
 
@@ -672,7 +684,15 @@ def cb_einsum_ml(
         spatial_vars[u] = add_mul_chain(model, sp_contribs, 1, cap, 'spatial_cost_'+name[u])
         temporal = add_mul_chain(model, tp_contribs, 1, max_iters, 'temporal_cost_'+name[u])
         traffic_vars[u] = model.NewIntVar(op_size[u.op], max_iters, 'total_cost_'+name[u])
-        model.AddMultiplicationEquality(traffic_vars[u], (spatial_vars[u], temporal))
+        # An operand over every dim moves the whole iteration space whatever
+        # the schedule: exactly op_size under perfect division. Stating it
+        # directly avoids a product with a fixed result over huge domains,
+        # which CP-SAT's presolve probing propagates slowly (elementwise
+        # einsums: seconds, growing with the dim sizes).
+        if perfect_division and set(operand_dims[u.op]) == set(dim_sizes):
+            model.Add(traffic_vars[u] == op_size[u.op])
+        else:
+            model.AddMultiplicationEquality(traffic_vars[u], (spatial_vars[u], temporal))
 
     # capacity constraint per memory
     for lvl, mems in enumerate(p.memories):
@@ -763,28 +783,46 @@ def cb_einsum_ml(
         energy_capped |= part_ub > part_cap
         part = model.NewIntVar(0, min(part_ub, part_cap), 'energy_'+p.label(k))
         parts_ub += min(part_ub, part_cap)
-        model.Add(part == costs.read_energy * sum(reads[k]) + costs.write_energy * sum(writes[k]))
+        # CP-SAT also rejects a linear constraint whose terms could sum past
+        # int64max / 2, so count reads and writes first, each bounded by what
+        # fits in the share (implied by the cap, so nothing more is excluded)
+        terms = []
+        for kind, e, acc in (('reads', costs.read_energy, reads[k]),
+                             ('writes', costs.write_energy, writes[k])):
+            if e == 0 or not acc:
+                continue
+            n = model.NewIntVar(0, min(len(acc) * max_iters, part_cap // e),
+                                p.label(k)+'_'+kind)
+            model.Add(n == sum(acc))
+            terms.append(e * n)
+        model.Add(part == sum(terms))
         energy_parts.append(part)
     energy_ub = max(1, parts_ub + compute_energy * max_iters)
     energy = model.NewIntVar(0, energy_ub, 'energy')
     model.Add(energy == sum(energy_parts) + compute_energy * max_iters)
 
-    # Delay: each memory's read and write ports work in parallel with all
-    # other ports; delay is the busiest port. Replicated memories split
-    # their accesses evenly over their instances.
-    ports = []  # (memory key, 'read'/'write', time var per instance)
+    # Delay: each memory's read and write ports (or its one shared port) work
+    # in parallel with all other ports; delay is the busiest port. Replicated
+    # memories split their accesses evenly over their instances.
+    ports = []  # (memory key, 'read'/'write'/'read/write', time var per instance)
     delay_ub = 1
     for k, costs in p.mem_costs.items():
-        for kind, terms, t in (('read', reads[k], costs.read_time),
-                               ('write', writes[k], costs.write_time)):
-            if not terms or t == 0:
+        # per port: (kind, [(time per element, access terms)])
+        rd = (costs.read_time, reads[k])
+        wr = (costs.write_time, writes[k])
+        kinds = ([('read/write', [rd, wr])] if costs.shared_port
+                 else [('read', [rd]), ('write', [wr])])
+        for kind, groups in kinds:
+            groups = [(t, terms) for t, terms in groups if terms and t != 0]
+            if not groups:
                 continue
-            pfx = p.label(k)+'_'+kind
-            port_ub = t * max_iters * len(terms)
+            pfx = p.label(k)+'_'+kind.replace('/', '')
+            port_ub = sum(t * max_iters * len(terms) for t, terms in groups)
             delay_ub = max(delay_ub, port_ub)
             # per-instance time = ceil(busy / instances)
             rounded_up = model.NewIntVar(0, port_ub + total_fan, pfx+'_total_time')
-            model.Add(rounded_up == t * sum(terms) + instances[k[0]] - 1)
+            model.Add(rounded_up == sum(t * sum(terms) for t, terms in groups)
+                      + instances[k[0]] - 1)
             pv = model.NewIntVar(0, port_ub, pfx+'_time')
             model.AddDivisionEquality(pv, rounded_up, instances[k[0]])
             ports.append((k, kind, pv))
@@ -831,10 +869,14 @@ def cb_einsum_ml(
         if compute_var is not None:
             model.Add(delay >= compute_time * -(-max_iters // total_fan))
         dram = p.mem_costs[(num_levels, 0)]
-        model.Add(delay >= dram.read_time * sum(op_size[op] for op in operands
-                                                if op != output_operand and p.op_levels[op]))
-        if p.op_levels[output_operand]:
-            model.Add(delay >= dram.write_time * op_size[output_operand])
+        dram_read = dram.read_time * sum(op_size[op] for op in operands
+                                         if op != output_operand and p.op_levels[op])
+        dram_write = dram.write_time * op_size[output_operand] if p.op_levels[output_operand] else 0
+        if dram.shared_port:
+            model.Add(delay >= dram_read + dram_write)
+        else:
+            model.Add(delay >= dram_read)
+            model.Add(delay >= dram_write)
 
     if objective == 'energy':
         model.Minimize(energy)
@@ -861,6 +903,9 @@ def cb_einsum_ml(
         solver.parameters.num_workers = num_workers
     if linearization_level is not None:
         solver.parameters.linearization_level = linearization_level
+    invalid = model.Validate()
+    if invalid:  # e.g. domains too large; Solve would only report MODEL_INVALID
+        raise ValueError('invalid CP-SAT model: ' + invalid)
     status = solver.Solve(model)
     if verbose:
         print(solver.ResponseStats())
