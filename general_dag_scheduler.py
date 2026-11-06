@@ -648,8 +648,8 @@ def _build_factor_constraints(sm: SchedulerModel, partial_sums: bool = False) ->
       (we would introduce recompute for j's einsum otherwise).  Unless
       partial_sums, an output's allowed dims exclude its reduction dims, so
       this also forbids temporal reduction outside it (partial-sum spilling).
-    - With partial_sums, a temporal reduction loop enclosing an output must
-      not also enclose a consumer of it (it would read an incomplete sum).
+    - A reduction loop enclosing an einsum's operands must not also enclose
+      a consumer of its output (it would read an incomplete sum).
     - Non-anchor operands must have all temporal and parallel factors equal 
       to 1 (only the anchor's factors count for the node).
     - Reinterpreted dimensions (a dimension present in one occurrence but not
@@ -694,22 +694,31 @@ def _build_factor_constraints(sm: SchedulerModel, partial_sums: bool = False) ->
                             model.Add(sm.parallel_dim[op][dim] == 1).OnlyEnforceIf(
                                 sm.ancestor[op][u2])
 
-    # Partial sums: a temporal reduction loop enclosing an output must not
-    # also enclose a consumer of that output.  The first rule above already
-    # forbids this unless the consumer's einsum has a dim of the same name;
-    # this covers that case.  (A consumer of a consumer inside the loop forces
-    # the consumer itself inside, by the timeline constraints.)
-    if partial_sums:
-        for e in sm.einsums:
-            o = e.output_operand
-            for c in sm.operand_groups[sm.original_names[o]]["consumers"]:
-                for dim in e.dim_sizes:
-                    if dim in sm.all_operand_dims[o] or dim not in sm.op_allowed_temp_dims[c]:
+    # A reduction loop of an einsum must not enclose any of its operands
+    # together with any operand of a consumer of its output (the consumer
+    # would read an incomplete sum).  Checking every operand, not just the
+    # output, covers a loop below the output's buffer that encloses only the
+    # einsum's inputs.  The first rule above already forbids this unless the
+    # consumer's einsum has a dim of the same name; this covers that case.
+    # (A consumer of a consumer inside the loop forces the consumer itself
+    # inside, by the timeline constraints.)
+    for e in sm.einsums:
+        o = e.output_operand
+        for k in sm.einsums:
+            if not any(sm.original_names[y] == sm.original_names[o]
+                       for y in k.operand_dims if y != k.output_operand):
+                continue
+            for dim in e.dim_sizes:
+                if dim in sm.all_operand_dims[o] or dim not in k.dim_sizes:
+                    continue
+                for a in ops:
+                    if dim not in sm.temporal_dim[a]:
                         continue
-                    for a in ops:
-                        if dim in sm.temporal_dim[a]:
-                            model.Add(sm.temporal_dim[a][dim] == 1).OnlyEnforceIf(
-                                sm.ancestor[a][o], sm.ancestor[a][c])
+                    for x in e.operand_dims:
+                        for y in k.operand_dims:
+                            enclosed = [sm.ancestor[a][x], sm.ancestor[a][y]]
+                            model.Add(sm.temporal_dim[a][dim] == 1).OnlyEnforceIf(enclosed)
+                            model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(enclosed)
 
     # Hierarchical spatial bounds: if i is an ancestor of j, then i's spatial tile
     # must physically contain j's spatial tile for any shared dimension.
