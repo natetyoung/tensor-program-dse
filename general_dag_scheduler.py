@@ -1242,14 +1242,14 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
         if sm.einsums[i].compute_cost == 0:
             continue
         else:
-            min_compute_cost += sm.einsums[i].compute_cost * sm.all_compute_iters[i].Proto().domain[0]
-            max_compute_cost += sm.einsums[i].compute_cost * sm.all_compute_iters[i].Proto().domain[1]
+            min_compute_cost += sm.einsums[i].compute_cost * sm.all_compute_iters[i].proto.domain[0]
+            max_compute_cost += sm.einsums[i].compute_cost * sm.all_compute_iters[i].proto.domain[1]
 
     min_communication_cost = 0
     max_communication_cost = 0
     for op in ops:
-        min_communication_cost += sm.total_cost_vars[op].Proto().domain[0]
-        max_communication_cost += sm.total_cost_vars[op].Proto().domain[1]
+        min_communication_cost += sm.total_cost_vars[op].proto.domain[0]
+        max_communication_cost += sm.total_cost_vars[op].proto.domain[1]
     
     sm.final_compute_cost = model.NewIntVar(min_compute_cost, max_compute_cost, 'final_compute_cost')
     model.Add(sm.final_compute_cost == sum(sm.all_compute_iters[i] * sm.einsums[i].compute_cost
