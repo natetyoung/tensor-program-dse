@@ -48,12 +48,29 @@ class Problem(NamedTuple):
     compute_time: int
     compute_energy: int
     compute_accesses: bool
+    reuse_ops: List[List[FrozenSet[str]]]  # per level and array dim: operands it must reuse
+    optional: FrozenSet[Unit]              # units the schedule may leave out (bypass)
 
-    def endpoints(self, u):
-        '''(memory read, memory written) by u's transfers.'''
+    def endpoints(self, u, src=None):
+        '''(memory read, memory written) by u's transfers; src defaults to
+        u's parent when every unit is kept.'''
+        src = self.unit_src[u] if src is None else src
         if u.op == self.output:
-            return self.unit_mem[u], self.unit_src[u]
-        return self.unit_src[u], self.unit_mem[u]
+            return self.unit_mem[u], src
+        return src, self.unit_mem[u]
+
+    def candidates(self, op, lvl):
+        '''Memories that may serve op at levels >= lvl, innermost first: its
+        units up to and including the first one that is not optional, then
+        DRAM (unit None) if all are. The first kept one serves.'''
+        cands = []
+        for l in self.op_levels[op]:
+            if l >= lvl:
+                u = Unit(op, l)
+                cands.append((u, self.unit_mem[u]))
+                if u not in self.optional:
+                    return cands
+        return cands + [(None, (len(self.memories), 0))]
 
     def crossed(self, op, lo, hi):
         '''(level, array dim) pairs of the fanouts at levels [lo, hi) that
@@ -93,7 +110,8 @@ def divisors(n):
 
 def make_problem(operand_dims, output_operand, dim_sizes, capacities, level_costs=None,
                  dram_costs=MemCosts(), fanouts=None, multicast=False,
-                 compute_time=0, compute_energy=0, compute_accesses=True):
+                 compute_time=0, compute_energy=0, compute_accesses=True, reuse=False,
+                 optional=None):
     '''Validate and normalize cb_einsum_ml's architecture arguments.'''
     operands = list(operand_dims)
     if isinstance(capacities, int):
@@ -106,8 +124,10 @@ def make_problem(operand_dims, output_operand, dim_sizes, capacities, level_cost
     fanouts = [f if isinstance(f, tuple) else (f,) for f in fanouts]
     if isinstance(multicast, bool):
         multicast = [multicast] * num_levels
-    if len(fanouts) != num_levels or len(multicast) != num_levels:
-        raise ValueError('fanouts and multicast need one entry per level')
+    if isinstance(reuse, bool):
+        reuse = [reuse] * num_levels
+    if len(fanouts) != num_levels or len(multicast) != num_levels or len(reuse) != num_levels:
+        raise ValueError('fanouts, multicast and reuse need one entry per level')
 
     def check_ops(ops, where):
         for op in ops:
@@ -133,25 +153,30 @@ def make_problem(operand_dims, output_operand, dim_sizes, capacities, level_cost
                  for m, mem in enumerate(memories[lvl])}
     mem_costs[dram] = dram_costs
 
-    mc_ops = []
-    for l, entry in enumerate(multicast):
-        if isinstance(entry, bool):
-            entry = [entry] * len(fanouts[l])
-        elif any(isinstance(e, str) for e in entry):
-            # a flat operand list is only unambiguous for a 1-D fanout
-            if len(fanouts[l]) > 1:
-                raise ValueError('multicast['+str(l)+'] must give one entry per array dim of '
-                                 'fanouts['+str(l)+'], e.g. (('+repr(entry[0])+',), ...)')
-            entry = [entry]
-        elif len(entry) != len(fanouts[l]):
-            raise ValueError('multicast['+str(l)+'] needs one entry per array dim of fanouts['+str(l)+']')
-        row = []
-        for e in entry:
-            if isinstance(e, bool):
-                e = operands if e else ()
-            check_ops(e, 'multicast')
-            row.append(frozenset(e))
-        mc_ops.append(row)
+    def per_array_dim(arg, what):
+        # per level and array dim: frozenset of operands
+        rows = []
+        for l, entry in enumerate(arg):
+            if isinstance(entry, bool):
+                entry = [entry] * len(fanouts[l])
+            elif any(isinstance(e, str) for e in entry):
+                # a flat operand list is only unambiguous for a 1-D fanout
+                if len(fanouts[l]) > 1:
+                    raise ValueError(what+'['+str(l)+'] must give one entry per array dim of '
+                                     'fanouts['+str(l)+'], e.g. (('+repr(entry[0])+',), ...)')
+                entry = [entry]
+            elif len(entry) != len(fanouts[l]):
+                raise ValueError(what+'['+str(l)+'] needs one entry per array dim of fanouts['+str(l)+']')
+            row = []
+            for e in entry:
+                if isinstance(e, bool):
+                    e = operands if e else ()
+                check_ops(e, what)
+                row.append(frozenset(e))
+            rows.append(row)
+        return rows
+    mc_ops = per_array_dim(multicast, 'multicast')
+    reuse_ops = per_array_dim(reuse, 'reuse')
 
     units = [Unit(op, lvl) for lvl in range(num_levels) for op in operands if Unit(op, lvl) in unit_mem]
     op_levels = {op: [lvl for lvl in range(num_levels) if Unit(op, lvl) in unit_mem] for op in operands}
@@ -161,22 +186,42 @@ def make_problem(operand_dims, output_operand, dim_sizes, capacities, level_cost
         unit_src[u] = unit_mem[Unit(u.op, outer[0])] if outer else dram
     comp_mem = {op: unit_mem[Unit(op, op_levels[op][0])] if op_levels[op] else dram
                 for op in operands}
+    if optional is None:
+        optional = [()] * num_levels
+    if len(optional) != num_levels:
+        raise ValueError('optional needs one entry per level')
+    opt_units = set()
+    for lvl, ops in enumerate(optional):
+        check_ops(ops, 'optional')
+        for op in ops:
+            if Unit(op, lvl) not in unit_mem:
+                raise ValueError('optional operand '+op+' is in no L'+str(lvl)+' memory')
+            if op == output_operand:
+                raise ValueError('the output cannot be optional')
+            opt_units.add(Unit(op, lvl))
     return Problem(operand_dims, output_operand, dim_sizes, memories, mem_costs, fanouts,
                    mc_ops, units, op_levels, unit_mem, unit_src, comp_mem,
-                   compute_time, compute_energy, compute_accesses)
+                   compute_time, compute_energy, compute_accesses, reuse_ops,
+                   frozenset(opt_units))
 
 def evaluate_schedule(p:Problem, order, factors, par_rows):
     '''
     Independent plain-Python validity check and cost of a schedule.
-    order: Unit per slot, outermost first. factors: dim -> temporal factor
-    per bucket (len(order) + 1). par_rows: level -> per array dim
-    {dim: parallel factor}. Returns dict with per-unit 'spatial' (tile per
+    order: Unit per slot, outermost first; optional units left out are
+    bypassed. factors: dim -> temporal factor per bucket (len(order) + 1).
+    par_rows: level -> per array dim {dim: parallel factor}. Returns dict with per-unit 'spatial' (tile per
     instance) and 'traffic' (elements moved, summed over instances), and
     'energy', 'delay', 'ports' ((memory, 'read'/'write', or 'read/write' if
     shared_port) -> time per instance).
     '''
     num_levels = len(p.memories)
     iters = prod(p.dim_sizes.values())
+    kept = set(order)
+    assert set(p.units) - p.optional <= kept, ('required unit missing', order)
+
+    def source(op, lvl):
+        # first kept memory holding op at levels >= lvl, or DRAM
+        return next(key for c, key in p.candidates(op, lvl) if c is None or c in kept)
 
     # Level l's parallel loops sit just outside its first slot; if used, every
     # slot above level l comes first.
@@ -190,6 +235,10 @@ def evaluate_schedule(p:Problem, order, factors, par_rows):
                 eff[d][b] *= f
         if par_tot[l] > 1:
             assert all(u.lvl > l for u in order[:b]), ('parallel level not blocked', l, order)
+        for s, row in enumerate(rows):
+            for d, f in row.items():
+                assert f == 1 or not any(d in p.operand_dims[op] for op in p.reuse_ops[l][s]), \
+                    ('parallel dim not reused', l, s, d)
     instances = [prod(par_tot.get(l, 1) for l in range(lvl, num_levels)) for lvl in range(num_levels + 1)]
     for d, size in p.dim_sizes.items():
         assert prod(eff[d]) >= size, ('dim not covered', d)
@@ -206,9 +255,10 @@ def evaluate_schedule(p:Problem, order, factors, par_rows):
         sp = prod(eff[d][b] for b in range(g + 1, len(order) + 1) for d in p.operand_dims[u.op])
         tp = prod(eff[d][b] for b in range(g + 1) for d in p.dim_sizes)
         spatial[u], traffic[u] = sp, sp * tp
-        mc = shared(u.op, u.lvl, p.unit_src[u][0])
+        src = source(u.op, u.lvl + 1)
+        mc = shared(u.op, u.lvl, src[0])
         assert traffic[u] % mc == 0, (u, mc)
-        rd, wr = p.endpoints(u)
+        rd, wr = p.endpoints(u, src)
         reads[rd] += traffic[u] if u.op == p.output else traffic[u] // mc
         writes[wr] += traffic[u] // mc if u.op == p.output else traffic[u]
         if u.op == p.output:
@@ -223,12 +273,14 @@ def evaluate_schedule(p:Problem, order, factors, par_rows):
             writes[rd] += fill
     for lvl, mems in enumerate(p.memories):
         for mem in mems:
-            assert sum(spatial[Unit(op, lvl)] for op in mem.ops) <= mem.cap, ('over capacity', lvl, mem)
+            assert sum(spatial.get(Unit(op, lvl), 0) for op in mem.ops) <= mem.cap, \
+                ('over capacity', lvl, mem)
 
     # compute reads each input and read-modify-writes the output every
     # iteration (no read for an element's first write); padding ignored
     if p.compute_accesses:
-        for op, key in p.comp_mem.items():
+        for op in p.operand_dims:
+            key = source(op, 0)
             accesses = -(-iters // shared(op, 0, key[0]))
             if op == p.output:
                 out_size = prod(p.dim_sizes[d] for d in p.operand_dims[op])
@@ -347,6 +399,8 @@ def cb_einsum_ml(
     objective:str = 'edp',
     fanouts:List[Union[int,Tuple[int,...]]] = None,
     multicast:Union[bool,List[Union[bool,Tuple]]] = False,
+    reuse:Union[bool,List[Union[bool,Tuple]]] = False,
+    optional:List[Tuple[str,...]] = None,
     compute_time:int = 0,
     compute_energy:int = 0,
     compute_accesses:bool = True,
@@ -398,6 +452,13 @@ def cb_einsum_ml(
       once). An array dim may be parallel over reduction dims if it
       multicasts the output, and over output dims if it multicasts an input
       or nothing.
+    - reuse[l]: like multicast[l], operands each array dim must reuse
+      (AccelForge's spatial reuse): it may only be parallel over dims none
+      of them has. Default False: no restriction.
+    - optional[l]: operands (inputs only) whose level-l unit the schedule
+      may leave out (AccelForge's may_keep): accesses then go to the next
+      kept memory up holding the operand (or DRAM), and from below to the
+      next one down. Left-out units are not in the returned order.
     - compute_time: cycles per iteration per compute unit; adds a compute
       port of compute_time x ceil(iterations / total parallelism).
     - compute_energy: energy per iteration.
@@ -430,7 +491,7 @@ def cb_einsum_ml(
       perfect_division, where merging is not exact.
 
     Cost model: traffic of unit (op, l) moves data between level l and its
-    parent (next level up holding op, or DRAM): inputs are read from the
+    parent (next kept level up holding op, or DRAM): inputs are read from the
     parent and written to l, the output the reverse (plus, with
     partial_sums, the fills read back from the parent). Energy is the sum of
     read_energy + write_energy over every access. Delay is the busiest port:
@@ -459,7 +520,7 @@ def cb_einsum_ml(
         factors, rows = split_merged(groups, dim_sizes, inner.order, inner.factors, inner.par_rows)
         p = make_problem(operand_dims, output_operand, dim_sizes, capacities, level_costs,
                          dram_costs, fanouts, multicast, compute_time, compute_energy,
-                         compute_accesses)
+                         compute_accesses, reuse, optional)
         ev = evaluate_schedule(p, inner.order, factors, rows)
         assert (ev['energy'], ev['delay']) == (inner.energy, inner.delay), (ev['energy'], ev['delay'])
         if verbose:
@@ -471,7 +532,7 @@ def cb_einsum_ml(
                         parallel, rows)
     p = make_problem(operand_dims, output_operand, dim_sizes, capacities, level_costs,
                      dram_costs, fanouts, multicast, compute_time, compute_energy,
-                     compute_accesses)
+                     compute_accesses, reuse, optional)
     model = cp_model.CpModel()
     operands = list(operand_dims)
     units = p.units
@@ -482,6 +543,39 @@ def cb_einsum_ml(
     total_fan = prod(prod(f) for f in p.fanouts)
     op_size = {op: prod(dim_sizes[d] for d in operand_dims[op]) for op in operands}
     name = {u: u.op+'_L'+str(u.lvl) for u in units}
+
+    # present[u]: optional unit u is kept. A left-out unit keeps its slot (a
+    # phantom: tile 1, no capacity, no accesses, no placement rules); its
+    # buckets merge when the schedule is read back.
+    present = {u: model.NewBoolVar(name[u]+'_kept') for u in units if u in p.optional}
+    def kept(u):
+        return [present[u]] if u in present else []
+    def all_of(lits, pfx):
+        # literal for the conjunction of lits (None: always true)
+        if len(lits) <= 1:
+            return lits[0] if lits else None
+        v = model.NewBoolVar(pfx)
+        model.AddBoolAnd(lits).OnlyEnforceIf(v)
+        model.AddBoolOr([l.Not() for l in lits]).OnlyEnforceIf(v.Not())
+        return v
+    def gated(x, lit, ub, pfx):
+        # x if lit else 0
+        if lit is None:
+            return x
+        v = model.NewIntVar(0, ub, pfx)
+        model.Add(v == x).OnlyEnforceIf(lit)
+        model.Add(v == 0).OnlyEnforceIf(lit.Not())
+        return v
+    def serving(op, lvl, below, pfx):
+        # (unit or None, memory, literal: it serves op) for each candidate
+        # memory at levels >= lvl; below: literals of the accessing unit
+        cands, skipped, out = p.candidates(op, lvl), [], []
+        for c, key in cands:
+            lit = all_of(below + (kept(c) if c else []) + [present[x].Not() for x in skipped],
+                         pfx+'_from_'+(name[c] if c else 'DRAM'))
+            out.append((c, key, lit))
+            skipped.append(c)
+        return out
 
     # Factor domains. Every cost is non-decreasing in each temporal factor,
     # so an optimum can shrink one until it is ceil(size / product of the
@@ -514,11 +608,18 @@ def cb_einsum_ml(
         pos_vars[u] = model.NewIntVar(0, num_slots - 1, name[u]+'_pos')
         model.Add(pos_vars[u] == sum(g * placement_vars[u][g] for g in range(num_slots)))
 
-    # inclusion: outer level loaded before inner level
-    for op in operands:
+    # inclusion: outer level loaded before inner level (among kept units)
+    def nested_pairs(op):
+        # (inner, outer) units of op with only optional units between
         lvls = p.op_levels[op]
-        for inner, outer in zip(lvls, lvls[1:]):
-            model.Add(pos_vars[Unit(op, outer)] < pos_vars[Unit(op, inner)])
+        for i, lo in enumerate(lvls):
+            for hi in lvls[i + 1:]:
+                yield Unit(op, lo), Unit(op, hi)
+                if Unit(op, hi) not in p.optional:
+                    break
+    for op in operands:
+        for inner, outer in nested_pairs(op):
+            model.Add(pos_vars[outer] < pos_vars[inner]).OnlyEnforceIf(kept(inner) + kept(outer))
 
     if blocked:
         for u in units:
@@ -539,14 +640,15 @@ def cb_einsum_ml(
     # Parallel factors. Level l's parallel loops sit in bucket par_bucket[l]
     # (fixed, since used parallelism forces outer levels' slots before it).
     # An array dim may be parallel over reduction dims if it multicasts the
-    # output, and over output dims if it multicasts an input or nothing.
+    # output, and over output dims if it multicasts an input or nothing; never
+    # over dims of an operand it must reuse.
     reduction_dims = [d for d in dim_sizes if d not in operand_dims[output_operand]]
     def allowed_dims(l, s):
         ops = p.mc_ops[l][s]
         dims = reduction_dims if output_operand in ops else []
         if not ops or ops - {output_operand}:
             dims = dims + list(operand_dims[output_operand])
-        return dims
+        return [d for d in dims if not any(d in operand_dims[op] for op in p.reuse_ops[l][s])]
     par_levels = [l for l in range(num_levels)
                   if any(size > 1 and allowed_dims(l, s) for s, size in enumerate(p.fanouts[l]))]
     par_bucket = {l: sum(1 for u in units if u.lvl > l) for l in par_levels}
@@ -602,10 +704,12 @@ def cb_einsum_ml(
                 for u in units:
                     # dim participates in unit just above bucket b (move out for free)
                     if b > 0 and dim in operand_dims[u.op]:
-                        model.Add(factor_vars[dim][b] == 1).OnlyEnforceIf(placement_vars[u][b-1])
+                        model.Add(factor_vars[dim][b] == 1).OnlyEnforceIf(
+                            [placement_vars[u][b-1]] + kept(u))
                     # dim does not participate in unit just below bucket b (move in)
                     if b < num_slots and dim not in operand_dims[u.op]:
-                        model.Add(factor_vars[dim][b] == 1).OnlyEnforceIf(placement_vars[u][b])
+                        model.Add(factor_vars[dim][b] == 1).OnlyEnforceIf(
+                            [placement_vars[u][b]] + kept(u))
 
             # unless partial_sums, forbid temporal reduction (no partial
             # spilling); innermost output slot is the deepest, so this implies
@@ -631,6 +735,23 @@ def cb_einsum_ml(
             model.Add(factor_product == dim_sizes[dim])
         else:
             model.Add(factor_product >= dim_sizes[dim])
+
+    # A left-out unit's slot is a phantom that could sit anywhere; pin it next
+    # to a bucket without temporal loops (inside or outside it). Any
+    # placement can be moved there: the loops outside it can move inside
+    # (both buckets are on the same side of every kept slot), and the side
+    # can follow the tie-breaking order below.
+    if present:
+        no_loops = []
+        for b in range(num_buckets):
+            v = model.NewBoolVar('no_loops_'+str(b))
+            for d in dim_sizes:
+                model.Add(factor_vars[d][b] == 1).OnlyEnforceIf(v)
+            no_loops.append(v)
+        for u, k in present.items():
+            for g in range(num_slots):
+                model.AddBoolOr([no_loops[g], no_loops[g + 1]]).OnlyEnforceIf(
+                    [placement_vars[u][g], k.Not()])
 
     # Tie-breaking: adjacent slots separated by an all-ones bucket can be
     # swapped without changing any cost, so require them in canonical rank
@@ -674,22 +795,28 @@ def cb_einsum_ml(
         sp_contribs, tp_contribs = [], []
         for b in range(num_buckets):
             sc = model.NewIntVar(1, cap, name[u]+'_spatial_contrib_'+str(b))
-            model.Add(sc == sp_prods[u.op][b]).OnlyEnforceIf(inner_vars[u][b])
+            model.Add(sc == sp_prods[u.op][b]).OnlyEnforceIf([inner_vars[u][b]] + kept(u))
             model.Add(sc == 1).OnlyEnforceIf(inner_vars[u][b].Not())
             sp_contribs.append(sc)
             tc = model.NewIntVar(1, max_iters, name[u]+'_temporal_contrib_'+str(b))
-            model.Add(tc == tp_prods[b]).OnlyEnforceIf(inner_vars[u][b].Not())
+            model.Add(tc == tp_prods[b]).OnlyEnforceIf([inner_vars[u][b].Not()] + kept(u))
             model.Add(tc == 1).OnlyEnforceIf(inner_vars[u][b])
+            if u in present:
+                model.Add(sc == 1).OnlyEnforceIf(present[u].Not())
+                model.Add(tc == 1).OnlyEnforceIf(present[u].Not())
             tp_contribs.append(tc)
         spatial_vars[u] = add_mul_chain(model, sp_contribs, 1, cap, 'spatial_cost_'+name[u])
         temporal = add_mul_chain(model, tp_contribs, 1, max_iters, 'temporal_cost_'+name[u])
-        traffic_vars[u] = model.NewIntVar(op_size[u.op], max_iters, 'total_cost_'+name[u])
+        every_dim = perfect_division and set(operand_dims[u.op]) == set(dim_sizes)
+        traffic_vars[u] = model.NewIntVar(1 if u in present and not every_dim else op_size[u.op],
+                                          max_iters, 'total_cost_'+name[u])
         # An operand over every dim moves the whole iteration space whatever
         # the schedule: exactly op_size under perfect division. Stating it
         # directly avoids a product with a fixed result over huge domains,
         # which CP-SAT's presolve probing propagates slowly (elementwise
-        # einsums: seconds, growing with the dim sizes).
-        if perfect_division and set(operand_dims[u.op]) == set(dim_sizes):
+        # einsums: seconds, growing with the dim sizes). A left-out unit's
+        # traffic is never charged, so it may keep this value too.
+        if every_dim:
             model.Add(traffic_vars[u] == op_size[u.op])
         else:
             model.AddMultiplicationEquality(traffic_vars[u], (spatial_vars[u], temporal))
@@ -697,7 +824,10 @@ def cb_einsum_ml(
     # capacity constraint per memory
     for lvl, mems in enumerate(p.memories):
         for mem in mems:
-            model.Add(sum(spatial_vars[Unit(op, lvl)] for op in mem.ops) <= mem.cap)
+            # a left-out unit's tile is 1 and takes no space
+            opt = [present[Unit(op, lvl)] for op in mem.ops if Unit(op, lvl) in present]
+            model.Add(sum(spatial_vars[Unit(op, lvl)] for op in mem.ops)
+                      - len(opt) + sum(opt) <= mem.cap)
 
     # reads[k] / writes[k]: expressions for elements read from / written to
     # memory k, summed over instances.
@@ -707,20 +837,35 @@ def cb_einsum_ml(
     # Transfers. Instances that differ only in parallel dims the operand lacks
     # share one parent access: a multicast read for inputs, a reduced write
     # for the output. Those parallel factors are part of the unit's temporal
-    # product, so this divides exactly.
-    parent_traffic = {}
+    # product, so this divides exactly. An input unit's parent is its first
+    # kept candidate (see Problem.candidates); each candidate is charged the
+    # transfer gated by the literal that it serves.
+    parent_traffic = {}  # unit -> [(parent memory, literal or None, elements at parent)]
     for u in units:
-        shared = shared_factor_vars(u.op, u.lvl, p.unit_src[u][0])
-        if shared:
-            mc = add_mul_chain(model, shared, 1, total_fan, 'multicast_'+name[u])
-            parent_traffic[u] = model.NewIntVar(1, max_iters, 'parent_traffic_'+name[u])
-            model.AddMultiplicationEquality(traffic_vars[u], (parent_traffic[u], mc))
+        if u.op == output_operand:  # never optional, nor any memory above it
+            cands = [(None, p.unit_src[u], None)]
         else:
-            parent_traffic[u] = traffic_vars[u]
-        rd, wr = p.endpoints(u)
+            cands = serving(u.op, u.lvl + 1, kept(u), name[u])
+            writes[p.unit_mem[u]].append(gated(traffic_vars[u], present.get(u), max_iters,
+                                               'kept_traffic_'+name[u]))
+        parent_traffic[u] = []
+        for c, key, lit in cands:
+            pfx = name[u] if len(cands) == 1 else name[u]+'_from_'+(name[c] if c else 'DRAM')
+            moved = gated(traffic_vars[u], lit, max_iters, 'traffic_'+pfx)
+            shared = shared_factor_vars(u.op, u.lvl, key[0])
+            if shared:
+                mc = add_mul_chain(model, shared, 1, total_fan, 'multicast_'+pfx)
+                pt = model.NewIntVar(0 if lit is not None else 1, max_iters, 'parent_traffic_'+pfx)
+                model.AddMultiplicationEquality(moved, (pt, mc))
+            else:
+                pt = moved
+            parent_traffic[u].append((key, lit, pt))
+            if u.op != output_operand:
+                reads[key].append(pt)
         if u.op == output_operand:
+            rd, wr = p.endpoints(u)
             reads[rd].append(traffic_vars[u])
-            writes[wr].append(parent_traffic[u])
+            writes[wr].append(pt)
             if partial_sums:
                 # Fills: each parent write but an element's first is read back
                 # into u's memory. First visits are the padded output times
@@ -736,36 +881,37 @@ def cb_einsum_ml(
                 first = (add_mul_chain(model, [padded] + above, 1, max_iters, 'first_'+name[u])
                          if above else padded)
                 fill = model.NewIntVar(0, max_iters, 'fill_'+name[u])
-                model.Add(fill == parent_traffic[u] - first)
+                model.Add(fill == pt - first)
                 reads[wr].append(fill)
                 writes[rd].append(fill)
-        else:
-            reads[rd].append(parent_traffic[u])
-            writes[wr].append(traffic_vars[u])
 
     # Compute accesses: every iteration reads each input and read-modify-
     # writes the output in the operand's innermost memory (or DRAM). Compute
     # units sit below every fanout, so accesses to a memory at level li cross
     # the fanouts below li, sharing accesses as transfers do. The first write
     # of each output element needs no read. Padding is ignored.
-    comp_accesses = {}
+    comp_accesses = []  # (memory, accesses; 0 unless it serves compute)
     if compute_accesses:
-        for op, key in p.comp_mem.items():
-            shared = shared_factor_vars(op, 0, key[0])
-            if shared:
-                mc = add_mul_chain(model, shared, 1, total_fan, 'comp_multicast_'+op)
-                accesses = model.NewIntVar(1, max_iters, 'comp_accesses_'+op)
-                model.AddDivisionEquality(accesses, max_iters + mc - 1, mc)
-            else:
-                accesses = max_iters
-            comp_accesses[op] = accesses
-            if op == output_operand:
-                # no more reduction parallelism than there are reduction iterations
-                model.Add(accesses >= op_size[op])
-                writes[key].append(accesses)
-                reads[key].append(accesses - op_size[op])
-            else:
-                reads[key].append(accesses)
+        for op in operands:
+            # the innermost kept memory holding op (or DRAM) serves compute
+            for c, key, lit in serving(op, 0, [], 'comp_'+op):
+                pfx = 'comp_'+op+'_at_'+(name[c] if c else 'DRAM')
+                shared = shared_factor_vars(op, 0, key[0])
+                if shared:
+                    mc = add_mul_chain(model, shared, 1, total_fan, 'multicast_'+pfx)
+                    accesses = model.NewIntVar(1, max_iters, 'accesses_'+pfx)
+                    model.AddDivisionEquality(accesses, max_iters + mc - 1, mc)
+                else:
+                    accesses = max_iters
+                if op == output_operand:  # output units are never optional
+                    # no more reduction parallelism than there are reduction iterations
+                    model.Add(accesses >= op_size[op])
+                    writes[key].append(accesses)
+                    reads[key].append(accesses - op_size[op])
+                else:
+                    accesses = gated(accesses, lit, max_iters, 'kept_accesses_'+pfx)
+                    reads[key].append(accesses)
+                comp_accesses.append((key, accesses))
 
     # Energy: every access to every memory, plus the compute itself. Each
     # memory's share is its own variable, bounded as if every transfer moved
@@ -857,15 +1003,24 @@ def cb_einsum_ml(
     # (the shared factors are over dims the operand lacks).
     if redundant_bounds:
         for op in operands:
-            lvls = p.op_levels[op]
-            for inner, outer in zip(lvls, lvls[1:]):
-                model.Add(traffic_vars[Unit(op, inner)] >= traffic_vars[Unit(op, outer)])
-                model.Add(spatial_vars[Unit(op, inner)] <= spatial_vars[Unit(op, outer)])
+            for inner, outer in nested_pairs(op):
+                lits = kept(inner) + kept(outer)
+                model.Add(traffic_vars[inner] >= traffic_vars[outer]).OnlyEnforceIf(lits)
+                model.Add(spatial_vars[inner] <= spatial_vars[outer]).OnlyEnforceIf(lits)
         for u in units:
-            model.Add(parent_traffic[u] >= op_size[u.op])
+            for _, lit, pt in parent_traffic[u]:
+                model.Add(pt >= op_size[u.op]).OnlyEnforceIf([lit] if lit is not None else [])
+        # each kept unit moves its operand at least once, from the cheapest
+        # memory that may serve it
+        def min_transfer_energy(u):
+            if u.op == output_operand:
+                rd, wr = p.endpoints(u)
+                return p.mem_costs[rd].read_energy + p.mem_costs[wr].write_energy
+            return (min(p.mem_costs[key].read_energy for _, key in p.candidates(u.op, u.lvl + 1))
+                    + p.mem_costs[p.unit_mem[u]].write_energy)
         model.Add(energy >= compute_energy * max_iters + sum(
-            (p.mem_costs[p.endpoints(u)[0]].read_energy
-             + p.mem_costs[p.endpoints(u)[1]].write_energy) * op_size[u.op] for u in units))
+            min_transfer_energy(u) * op_size[u.op] * (present[u] if u in present else 1)
+            for u in units))
         if compute_var is not None:
             model.Add(delay >= compute_time * -(-max_iters // total_fan))
         dram = p.mem_costs[(num_levels, 0)]
@@ -907,13 +1062,31 @@ def cb_einsum_ml(
     if invalid:  # e.g. domains too large; Solve would only report MODEL_INVALID
         raise ValueError('invalid CP-SAT model: ' + invalid)
     status = solver.Solve(model)
+    if status == cp_model.INFEASIBLE:
+        # OR-Tools 9.15's presolve can wrongly prove infeasibility when a
+        # factor of the EDP product is affine in a Boolean (e.g. a left-out
+        # unit when every traffic is fixed; 9.14 is fine), so retry without it
+        solver.parameters.cp_model_presolve = False
+        status = solver.Solve(model)
     if verbose:
         print(solver.ResponseStats())
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
 
-    order = sorted(units, key=lambda u: solver.Value(pos_vars[u]))
-    factors = {d: [solver.Value(f) for f in factor_vars[d]] for d in dim_sizes}
+    # drop left-out units, merging the buckets on either side of each (both
+    # are on the same side of every kept slot)
+    order = []
+    factors = {d: [solver.Value(factor_vars[d][0])] for d in dim_sizes}
+    for g, u in enumerate(sorted(units, key=lambda u: solver.Value(pos_vars[u]))):
+        keep = u not in present or solver.Value(present[u])
+        if keep:
+            order.append(u)
+        for d in dim_sizes:
+            f = solver.Value(factor_vars[d][g + 1])
+            if keep:
+                factors[d].append(f)
+            else:
+                factors[d][-1] *= f
     parallel = {l: {d: solver.Value(v) for d, v in par_dims[l].items()} for l in par_levels}
     par_vals = {l: [{d: solver.Value(v) for d, v in row.items()} for row in par_rows[l]]
                 for l in par_levels}
@@ -922,17 +1095,23 @@ def cb_einsum_ml(
         print_loop_nest(order, factors, par_vals)
         for lvl, mems in enumerate(p.memories):
             for m, mem in enumerate(mems):
+                ops = [o for o in mem.ops if Unit(o, lvl) in order]
                 print(p.label((lvl, m))+' Spatial Costs:',
-                      [(o, solver.Value(spatial_vars[Unit(o, lvl)])) for o in mem.ops])
+                      [(o, solver.Value(spatial_vars[Unit(o, lvl)])) for o in ops])
                 print(p.label((lvl, m))+' Traffic:',
-                      [(o, solver.Value(traffic_vars[Unit(o, lvl)])) for o in mem.ops])
-        shared_acc = [(u.op+'@L'+str(u.lvl), solver.Value(parent_traffic[u])) for u in units
-                      if solver.Value(parent_traffic[u]) != solver.Value(traffic_vars[u])]
+                      [(o, solver.Value(traffic_vars[Unit(o, lvl)])) for o in ops])
+        left_out = [u.op+'@L'+str(u.lvl) for u in units if u not in order]
+        if left_out:
+            print('Left Out (bypassed):', left_out)
+        shared_acc = [(u.op+'@L'+str(u.lvl)+' from '+p.label(key), solver.Value(pt))
+                      for u in order for key, lit, pt in parent_traffic[u]
+                      if (lit is None or solver.Value(lit))
+                      and solver.Value(pt) != solver.Value(traffic_vars[u])]
         if shared_acc:
             print('Multicast Reads / Reduced Writes at Parent:', shared_acc)
         if comp_accesses:
-            print('Compute Accesses:', [(op+' @'+p.label(p.comp_mem[op]), solver.Value(n))
-                                        for op, n in comp_accesses.items()])
+            print('Compute Accesses:', [(p.label(key), solver.Value(n)) for key, n in comp_accesses
+                                        if solver.Value(n)])
         print('Port Times (per instance):', [(p.label(k)+' '+kind, solver.Value(pv))
                                              for k, kind, pv in ports])
         if compute_var is not None:
@@ -940,7 +1119,7 @@ def cb_einsum_ml(
 
     # cross-check against the independent evaluator
     ev = evaluate_schedule(p, order, factors, par_vals)
-    for u in units:
+    for u in order:
         assert ev['spatial'][u] == solver.Value(spatial_vars[u]), (u, ev['spatial'][u])
         assert ev['traffic'][u] == solver.Value(traffic_vars[u]), (u, ev['traffic'][u])
     e_val, d_val = ev['energy'], ev['delay']
