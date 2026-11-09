@@ -1,0 +1,18 @@
+# Llama-style SwiGLU feed-forward network with E experts, mirroring
+# tensor-program-dse/test_cases.py: llama_ffn_einsums(bs, h, d_ff, num_exp).
+# The activation is folded into the gate * up product, as there.
+# Rank variables: b = bs, h, f = d_ff, e = expert, j = h1 (output hidden dim).
+# Set BS, H, D_FF, N_EXP.
+workload:
+  rank_sizes:
+    B: {{BS}}
+    H: {{H}}
+    F: {{D_FF}}
+    E: {{N_EXP}}
+    J: {{H}}
+  bits_per_value: {All: 8}
+  einsums:
+  - "Y_up[b, f, e] = X[b, h] * W_up[h, f, e]"
+  - "Y_gate[b, f, e] = X[b, h] * W_gate[h, f, e]"
+  - "Y_mid[b, f, e] = Y_up[b, f, e] * Y_gate[b, f, e]"
+  - "Z[b, j] = Y_mid[b, f, e] * W_down[f, j, e]"

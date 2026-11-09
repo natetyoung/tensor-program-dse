@@ -1,0 +1,47 @@
+# One routed SwiGLU expert of DeepSeek-V4-Pro (Expert.forward: w1 gate, w3 up,
+# silu(gate) * up, w2 down), in the form of the gated-linear-unit experts of
+# accelforge/examples/workloads/transformers/_feedforward_types/mixture_of_experts.yaml
+# with the expert rank dropped. Same format and renames as gpt3_6.7B.yaml.
+#
+# Sizes from deepseek-ai/DeepSeek-V4-Pro config.json: hidden_size (dim) 7168,
+# moe_intermediate_size (inter_dim) 3072, 384 routed experts, 6 per token.
+# Tokens are split evenly across experts, as in AccelForge's MoE workloads: of
+# a batch of 64 x 65536 tokens, each expert gets 65536 * 6 / 384 = 1024 tokens
+# per batch element. SiLU and the clamp (swiglu_limit) are folded into FFH;
+# the router weighting (weights * x) is omitted. Every tensor has 16 bits (the
+# reference computes gate, up and FFH in float32 and stores fp4 weights).
+
+workload:
+  rank_sizes:
+    B: 64      # Batch index
+    XT: 1024   # Tokens routed to this expert, per batch element
+    G: 7168    # Model hidden dim (expert input, dim)
+    C: 3072    # Expert hidden dim (inter_dim)
+    J: 7168    # Model hidden dim (expert output, dim)
+
+  bits_per_value: {All: 16}
+  persistent_tensors: weight - Intermediates
+
+  einsums:
+  - einsum: "FFG[b, xt, c] = Z[b, xt, g] * WFFG[g, c]"      # gate projection (w1)
+    renames: {input: Z}
+  - einsum: "FFU[b, xt, c] = Z[b, xt, g] * WFFU[g, c]"      # up projection (w3)
+    renames: {input: Z}
+  - einsum: "FFH[b, xt, c] = FFG[b, xt, c] * FFU[b, xt, c]" # silu(gate) * up
+    renames: {input: FFG}
+  - einsum: "FFD[b, xt, j] = FFH[b, xt, c] * WFFD[c, j]"    # down projection (w2)
+    renames: {input: FFH}
+
+renames:
+  einsums:
+  - name: default
+    tensor_accesses:
+    - name: input
+      source: Inputs & Intermediates if len(All) == 3 else Inputs
+      expected_count: 1
+    - name: output
+      source: Outputs
+      expected_count: 1
+    - name: weight
+      source: ~(input | output)
+      expected_count: 1 if len(All) == 3 else 0

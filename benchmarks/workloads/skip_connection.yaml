@@ -1,0 +1,11 @@
+# Two projections plus a skip connection back to the input X, mirroring
+# tensor-program-dse/test_cases.py: skip_connection_einsums (Test Case 2).
+# The elementwise addition Out = Z + X is written as a product, which moves
+# the same data.
+workload:
+  rank_sizes: {H: 64, W: 64, C: 128, D: 256}
+  bits_per_value: {All: 8}
+  einsums:
+  - "Y[h, w, d] = X[h, w, c] * W1[c, d]"
+  - "Z[h, w, c] = Y[h, w, d] * W2[d, c]"
+  - "Out[h, w, c] = Z[h, w, c] * X[h, w, c]"

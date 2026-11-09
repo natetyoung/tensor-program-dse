@@ -1,0 +1,10 @@
+# A projection followed by two reduction-only einsums, mirroring
+# tensor-program-dse/test_cases.py: multi_stage_reduction_einsums (Test Case 3).
+# The weight W is renamed Wd, as W is also the rank of w here.
+workload:
+  rank_sizes: {N: 32, C: 64, H: 16, W: 16, D: 128}
+  bits_per_value: {All: 8}
+  einsums:
+  - "Y[n, d, h, w] = X[n, c, h, w] * Wd[d, c]"
+  - "Z[n, d] = Y[n, d, h, w]"
+  - "Out[n] = Z[n, d]"

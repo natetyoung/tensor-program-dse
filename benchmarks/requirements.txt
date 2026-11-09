@@ -1,0 +1,5 @@
+# Python >= 3.10. general_dag_scheduler.py (in the parent directory) needs
+# only ortools; ffm.py and export.py also need AccelForge, pinned to the
+# commit the comparison was developed against.
+ortools==9.15.6755
+accelforge @ git+https://github.com/Accelergy-Project/accelforge.git@7312a7d915625552bf6eb1db577941f8317b6ac7

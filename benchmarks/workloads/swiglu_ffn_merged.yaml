@@ -1,0 +1,20 @@
+# swiglu_ffn.yaml with the up and gate projections merged into one einsum
+# over an extra rank U (u = 0: up, u = 1: gate), so that FFM can reuse an
+# on-chip tile of X across both projections (AccelForge charges each einsum's
+# reads of an input separately). Y_mid reads both halves of Y_ug; it is
+# written as a sum over u rather than a product, which moves the same data.
+# Rank variables: b = bs, h, f = d_ff, e = expert, j = h1, u = up / gate.
+# Set BS, H, D_FF, N_EXP.
+workload:
+  rank_sizes:
+    B: {{BS}}
+    H: {{H}}
+    F: {{D_FF}}
+    E: {{N_EXP}}
+    J: {{H}}
+    U: 2
+  bits_per_value: {All: 8}
+  einsums:
+  - "Y_ug[b, f, e, u] = X[b, h] * W_ug[h, f, e, u]"
+  - "Y_mid[b, f, e] = Y_ug[b, f, e, u]"
+  - "Z[b, j] = Y_mid[b, f, e] * W_down[f, j, e]"

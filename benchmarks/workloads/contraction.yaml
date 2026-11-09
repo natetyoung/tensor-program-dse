@@ -1,0 +1,31 @@
+# C[m, l, n, p] = A[m, l, k] * B[k, n, p], with A as the weight. Same format
+# and renames as accelforge/examples/workloads/transformers/gpt/gpt3_6.7B.yaml.
+
+workload:
+  rank_sizes:
+    M: 210
+    L: 210
+    N: 210
+    P: 210
+    K: 2310
+
+  bits_per_value: {All: 8}
+  persistent_tensors: weight - Intermediates
+
+  einsums:
+  - einsum: "C[m, l, n, p] = A[m, l, k] * B[k, n, p]"
+    renames: {input: B}
+
+renames:
+  einsums:
+  - name: default
+    tensor_accesses:
+    - name: input
+      source: Inputs & Intermediates if len(All) == 3 else Inputs
+      expected_count: 1
+    - name: output
+      source: Outputs
+      expected_count: 1
+    - name: weight
+      source: ~(input | output)
+      expected_count: 1 if len(All) == 3 else 0

@@ -1,0 +1,30 @@
+# Mamba3 SISO SSD local (intra-chunk) contribution, mirroring
+# tensor-program-dse/siso_workload.py: siso_ssd_intra_chunk_einsums, einsum
+# for einsum and in the same order. Elementwise functions (multiply, subtract,
+# sum) are written as products of their operands, which moves the same data.
+#
+# Rank variables (ranks are the upper-case names): k = chunk, t / s =
+# destination / source token, n = state, p = value. As there, X and B
+# (indexed by s in the main branch) are read over t in the token-aligned
+# correction: X[k, S: t, p] and B[k, S: t, n].
+# Set K, Q, N, P.
+workload:
+  rank_sizes:
+    K: {{K}}
+    T: {{Q}}
+    S: {{Q}}
+    N: {{N}}
+    P: {{P}}
+  bits_per_value: {All: 32}
+  einsums:
+  - "X_scale[k, s, p] = X[k, s, p] * scale[k, s]"
+  - "G[k, t, s] = C_T[k, n, t] * B[k, s, n]"
+  - "M[k, t, s] = G[k, t, s] * triu[s, t]"
+  - "V[k, s, p] = X_scale[k, s, p] * e_minus[k, s]"
+  - "U[k, t, p] = M[k, t, s] * V[k, s, p]"
+  - "Y_scaled[k, t, p] = U[k, t, p] * e_plus[k, t]"
+  - "CB_elem[k, t, n] = C_T[k, n, t] * B[k, S: t, n]"
+  - "cb_diag[k, t] = CB_elem[k, t, n]"
+  - "cb_sg[k, t] = cb_diag[k, t] * shifted_gamma[k, t]"
+  - "correction[k, t, p] = X[k, S: t, p] * cb_sg[k, t]"
+  - "Y_local[k, t, p] = Y_scaled[k, t, p] * correction[k, t, p]"

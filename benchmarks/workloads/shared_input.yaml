@@ -1,0 +1,8 @@
+# Two einsums reading one input A, mirroring tensor-program-dse/test_cases.py:
+# shared_input_einsums (Test Case 1).
+workload:
+  rank_sizes: {I: 1024, J: 512, K: 256, L: 128}
+  bits_per_value: {All: 8}
+  einsums:
+  - "B[i, k] = A[i, j] * W1[j, k]"
+  - "C[i, l] = A[i, j] * W2[j, l]"
