@@ -57,12 +57,32 @@ Each tool can also be run on its own. `summarize.py` rebuilds the summary from w
 | `--steps ffm,dag` | Run only some steps. |
 | `--force` | Rerun steps whose results already exist. By default they are skipped, so an interrupted run can be resumed. |
 | `--no-hint` | Don't hint CP-SAT with single-einsum tilings (see below). |
+| `--measure-memory` | Record each step's peak memory (see [Measuring memory](#measuring-memory)). |
 
 ### Different machines
 - **Times depend on the machine.** The capped run takes its limit from the `ffm.json` produced on the same machine. Always run `ffm` and `capped` together, with the same `--threads`. `dag.py` warns if the thread counts differ.
 - **Every result records its machine:** threads, cores, memory, and the versions of Python, ortools, AccelForge and this repository. `summary.md` lists them.
 - **Mixed results:** if a results folder mixes machines or settings, `summary.md` says so; compare times only within one machine.
 - **Memory:** FFM's memory use grows with its number of worker processes. `kda_batched` is by far the largest case. If FFM is killed there, for example by the out-of-memory killer, rerun that case with fewer `--threads`, and use the same number for its DAG runs.
+
+### Measuring memory
+With `--measure-memory`, `run.py` and `einsum_run.py` run each tool step in its own transient systemd scope, which is its own cgroup. Export steps are not measured.
+- **What is recorded:** the cgroup's `memory.peak`, added to the step's result as `peak_memory` (`mb`, and `oom_kills`), and shown as `MB` columns in the summaries.
+- **What it covers:** every process of the step, so all of FFM's worker processes, with each page counted once.
+  - It covers the whole step, not only the timed part: imports, FFM's warm-up and its untimed detailed evaluation are included.
+  - It includes page cache the step reads in. Files already cached by other processes, such as shared libraries, are charged to those processes instead.
+- **Comparisons:** like times, peaks are only comparable at the same `--threads` on one machine.
+- **Skipped and failed steps:** a step skipped because its result exists keeps its old `peak_memory`, if any. A step rerun without the flag loses it. A failed step's peak, and whether the out-of-memory killer fired, is printed and listed under the failed steps.
+- **Requirements**, checked at start-up:
+  - cgroup v2: `stat -fc %T /sys/fs/cgroup` prints `cgroup2fs`;
+  - Linux 5.19 or newer, for `memory.peak`;
+  - a systemd user session: `systemctl --user status` works;
+  - the memory controller delegated to it: `cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers` includes `memory`.
+- **Quick test:** this should print about 315,000,000:
+  ```
+  systemd-run --user --scope -q sh -c 'python3 -c "x=b\"x\"*(300*2**20)"; cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.peak'
+  ```
+- **The core-count runs:** `cores.py` runs in one process, so it doesn't support `--measure-memory`.
 
 ## What is compared
 - **Architecture:** AccelForge's `snowcat` example arch.
@@ -109,7 +129,7 @@ Each tool can also be run on its own. `summarize.py` rebuilds the summary from w
 | tcm | `einsum_tcm.py EINSUM` | `results/<einsum>/tcm.json`, `tcm.txt` (mapping) |
 | cpsat | `einsum_cpsat.py EINSUM` | `results/<einsum>/cpsat.json`, `cpsat.txt` (mapping as evaluated by AccelForge, then the solver's output) |
 
-Options: `--list`, `--steps tcm,cpsat`, `--threads N` (both tools), `--time-limit S`, `--force`, `--summarize` (only rewrite the summary), and einsum names.
+Options: `--list`, `--steps tcm,cpsat`, `--threads N` (both tools), `--time-limit S`, `--force`, `--measure-memory` (see [Measuring memory](#measuring-memory)), `--summarize` (only rewrite the summary), and einsum names.
 
 ## Files
 

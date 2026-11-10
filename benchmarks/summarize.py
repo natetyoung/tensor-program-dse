@@ -27,12 +27,17 @@ def status(d):
         else 'feasible'
 
 
+def mb(r):
+    '''A result's peak memory in MB, or '' if not measured.'''
+    return f"{r['peak_memory']['mb']:.0f}" if r and r.get('peak_memory') else ''
+
+
 def seconds(v):
     return '' if v is None else f'{v:.1f}'
 
 
 def main():
-    rows, machines, notes = [], {}, []
+    rows, machines, notes, memory = [], {}, [], False
     for name in CASES:
         f = load(RESULTS / name / 'ffm.json')
         d = load(RESULTS / name / 'dag.json')
@@ -50,7 +55,8 @@ def main():
                      ratio(d, 'traffic_at_limit', ffm), status(d), seconds(d and d['wall_s']),
                      seconds(d and d.get('t_le_ffm_s')),
                      ratio(c, 'traffic_at_limit', ffm), status(c),
-                     seconds(c and c.get('t_le_ffm_s'))])
+                     seconds(c and c.get('t_le_ffm_s')), mb(f), mb(d), mb(c)])
+        memory = memory or any(map(mb, (f, d, c)))
         for tool, r in (('DAG', d), ('DAG capped', c)):
             for v in (r or {}).get('invalid_reduction_loops', []):
                 notes.append(f'- **{name} {tool}: invalid schedule:** {v}')
@@ -58,13 +64,20 @@ def main():
             notes.append(f"- {name}: FFM's detailed evaluation failed ({f['detail_error']}); "
                          "its traffic and time are the search's own.")
     head = ['case', 'capacity', 'FFM s', 'FFM traffic', 'DAG / FFM', 'DAG status', 'DAG s',
-            'DAG s to <= FFM', 'capped DAG / FFM', 'capped status', 'capped s to <= FFM']
+            'DAG s to <= FFM', 'capped DAG / FFM', 'capped status', 'capped s to <= FFM',
+            'FFM MB', 'DAG MB', 'capped MB']
+    if not memory:  # no result has peak memory: leave the columns out
+        head, rows = head[:-3], [r[:-3] for r in rows]
     out = ['# DAG scheduler vs. FFM (O3) on snowcat', '',
            "- Traffic: off-chip elements read + written. `/ FFM` below 1: the DAG scheduler "
            "moves less data. `DAG`: fixed time limit; `capped`: limited to FFM's time on the "
            "case. Times include model building and hint tiling; `s to <= FFM`: when the DAG "
            "scheduler first matched FFM's traffic.",
-           "- `bound`: CP-SAT's lower bound on traffic, over FFM's.", '',
+           "- `bound`: CP-SAT's lower bound on traffic, over FFM's.",
+           *(['- `MB`: peak memory of the whole step (all processes, including imports, '
+              "FFM's warm-up and detailed evaluation, and the DAG scheduler's hint tilings), "
+              'from `run.py --measure-memory`; it grows with --threads.'] if memory else []),
+           '',
            '| ' + ' | '.join(head) + ' |', '|' + '---|' * len(head)]
     out += ['| ' + ' | '.join(r) + ' |' for r in rows]
     if notes:
