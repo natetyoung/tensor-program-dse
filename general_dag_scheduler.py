@@ -622,11 +622,6 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool,
                 sm.fused[op][consumer])
             model.Add(sm.same_node[op][consumer] == 1).OnlyEnforceIf(
                 sm.fused[op][consumer])
-            # If not fused, the intervals must be fully separated.
-            if op in sm.fused[consumer]:
-                model.AddBoolOr(sm.totally_after[op][consumer], sm.totally_after[consumer][op]).OnlyEnforceIf(sm.fused[op][consumer].Not(), sm.fused[consumer][op].Not())
-            else:
-                model.AddBoolOr(sm.totally_after[op][consumer], sm.totally_after[consumer][op]).OnlyEnforceIf(sm.fused[op][consumer].Not())
             # Spatial factors must agree along any shared dimension.
             for dim in sm.all_operand_dims[op]:
                 if dim in sm.spatial_dim[consumer]:
