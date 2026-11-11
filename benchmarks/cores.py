@@ -6,8 +6,8 @@ FFM comparison.
 Usage:
     python cores.py [--time-limit S] [--cores 1,8] [--threads N] [--no-hint]
                     [--force] [CASE ...]
-Default cases: swiglu, kda_batched, siso_k128; default limit 1800 s
-per run (up to 3 hours for all six runs).
+Default cases: swiglu, kda_batched, gdn_decode, siso_k128, gqa_llama3_8b,
+kimi_k3_mla; default limit 1800 s per run (up to 6 hours for all twelve runs).
 
 The workloads are this repository's Python descriptions, with their
 compute_cost, accel_gran and operation (compute_workloads.py), not the
@@ -27,7 +27,8 @@ from common import RESULTS, available_cores, load, result_path
 from compute_workloads import WORKLOADS
 import dag
 
-DEFAULT_CASES = ['swiglu', 'kda_batched', 'siso_k128']
+DEFAULT_CASES = ['swiglu', 'kda_batched', 'gdn_decode', 'siso_k128', 'gqa_llama3_8b',
+                 'kimi_k3_mla']
 REPORT = RESULTS / 'compute_cores_report.md'
 
 

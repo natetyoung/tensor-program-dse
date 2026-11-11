@@ -1,0 +1,62 @@
+# Gated DeltaNet (GDN), full layer, decode, mirroring
+# tensor-program-dse/test_cases.py: gdn_full_decode_einsums (Test Case 12):
+# the GatedDeltaNet linear-attention layer of Qwen3.5. Elementwise functions
+# (silu, sigmoid, exp, softplus, norms) are written as products of their
+# operands, which moves the same data; the norms' sums are reductions.
+#
+# Rank variables (ranks are the upper-case names): hd = hidden, dk0 / dk1 =
+# d_k0 / d_k1, dv = d_v, h = key head, r = value head within its key head
+# (only when V_HEADS > K_HEADS; value-head tensors then carry h and r),
+# hist = conv history, oh = out_hidden.
+# Tensors renamed from test_cases.py: hidden -> X, S_{t-1} -> S_prev.
+# As there, k is produced over d_k0, and S_t (produced over d_k0) is read
+# over d_k1 by o.
+# Set HIDDEN, D_K, D_V, K_HEADS, V_HEADS, CONV_KERNEL.
+{% set VH = 'h, r' if V_HEADS > K_HEADS else 'h' %}
+{% macro lcan(name, dk, heads, norm) %}
+  - "{{name}}_lin_out[{{dk}}, {{heads}}] = X[hd] * {{name}}_lin_w[hd, {{dk}}, {{heads}}]"
+  - "{{name}}_partial_conv[{{dk}}, {{heads}}] = {{name}}_history[{{dk}}, {{heads}}, hist] * {{name}}_conv_w[{{dk}}, {{heads}}, hist]"
+  - "{{name}}_lin_out_scaled[{{dk}}, {{heads}}] = {{name}}_lin_out[{{dk}}, {{heads}}] * {{name}}_conv_w_0[{{dk}}, {{heads}}]"
+{% if norm %}
+  - "{{name}}_act_out[{{dk}}, {{heads}}] = {{name}}_lin_out_scaled[{{dk}}, {{heads}}] * {{name}}_partial_conv[{{dk}}, {{heads}}]"
+  - "{{name}}_computed_norm[{{heads}}] = {{name}}_act_out[{{dk}}, {{heads}}]"
+  - "{{name}}[{{dk}}, {{heads}}] = {{name}}_act_out[{{dk}}, {{heads}}] * {{name}}_computed_norm[{{heads}}]"
+{% else %}
+  - "{{name}}[{{dk}}, {{heads}}] = {{name}}_lin_out_scaled[{{dk}}, {{heads}}] * {{name}}_partial_conv[{{dk}}, {{heads}}]"
+{% endif %}
+{% endmacro %}
+workload:
+  rank_sizes:
+    HD: {{HIDDEN}}
+    DK0: {{D_K}}
+    DK1: {{D_K}}
+    DV: {{D_V}}
+    H: {{K_HEADS}}
+{% if V_HEADS > K_HEADS %}
+    R: {{V_HEADS // K_HEADS}}
+{% endif %}
+    HIST: {{CONV_KERNEL - 1}}
+    OH: {{HIDDEN}}
+  bits_per_value: {All: 8}
+  einsums:
+  # q, k, v: linear, short conv, silu, (l2 norm)
+{{ lcan("q", "dk1", "h", True) }}
+{{ lcan("k", "dk0", "h", True) }}
+{{ lcan("v", "dv", VH, False) }}
+  # g (decay) and b (beta)
+  - "a_inter[{{VH}}] = X[hd] * W_a[hd, {{VH}}]"
+  - "g[{{VH}}] = a_inter[{{VH}}] * exp_alog[{{VH}}] * dt_bias[{{VH}}]"
+  - "b_inter[{{VH}}] = X[hd] * W_b[hd, {{VH}}]"
+  - "b[{{VH}}] = b_inter[{{VH}}]"
+  # GDN core: S_t = g S_prev + k (b (v - g S_prev^T k))^T
+  - "kv_mem[dv, {{VH}}] = S_prev[dk0, dv, {{VH}}] * k[dk0, h]"
+  - "delta[dv, {{VH}}] = v[dv, {{VH}}] * kv_mem[dv, {{VH}}] * g[{{VH}}] * b[{{VH}}]"
+  - "S_t[dk0, dv, {{VH}}] = S_prev[dk0, dv, {{VH}}] * g[{{VH}}] * k[dk0, h] * delta[dv, {{VH}}]"
+  # S_t q -> RMSNorm
+  - "o[dv, {{VH}}] = S_t[DK0: dk1, dv, {{VH}}] * q[dk1, h]"
+  - "computed_o_rmsnorm[{{VH}}] = o[dv, {{VH}}]"
+  # output gate
+  - "z[dv, {{VH}}] = X[hd] * W_z[hd, dv, {{VH}}]"
+  # final output
+  - "o_gated[dv, {{VH}}] = o[dv, {{VH}}] * computed_o_rmsnorm[{{VH}}] * norm_weight[dv] * z[dv, {{VH}}]"
+  - "out[oh] = o_gated[dv, {{VH}}] * W_out[dv, {{VH}}, oh]"

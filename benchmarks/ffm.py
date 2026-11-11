@@ -56,19 +56,25 @@ def tree_lines(node, indent=0):
     return [pad + type(node).__name__]
 
 
+# FFM may write files to the working directory, so searches run in this one.
+# It lasts as long as the process: FFM's worker processes are reused across
+# searches and keep the directory they started in as their working directory,
+# so deleting it (as a per-search temporary directory would) makes any
+# os.getcwd() in them fail (e.g. in numba's error formatting).
+WORKDIR = tempfile.TemporaryDirectory()
+
+
 def search(spec, einsum_names):
     '''FFM's mapping search: (result, wall s).'''
-    # FFM may write files to the working directory.
     cwd = os.getcwd()
-    with tempfile.TemporaryDirectory() as tmp:
-        os.chdir(tmp)
-        try:
-            t0 = time.perf_counter()
-            result = map_workload_to_arch(spec, einsum_names=einsum_names,
-                                          print_progress=False, eval_in_detail=False)
-            return result, time.perf_counter() - t0
-        finally:
-            os.chdir(cwd)
+    os.chdir(WORKDIR.name)
+    try:
+        t0 = time.perf_counter()
+        result = map_workload_to_arch(spec, einsum_names=einsum_names,
+                                      print_progress=False, eval_in_detail=False)
+        return result, time.perf_counter() - t0
+    finally:
+        os.chdir(cwd)
 
 
 def warm_up(threads):

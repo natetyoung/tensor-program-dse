@@ -1,0 +1,54 @@
+# Kimi K3 gated multi-latent attention (MLA) block, prefill, mirroring
+# tensor-program-dse/test_cases.py: kimi_k3_mla_einsums (Test Case 14): the
+# KimiMLAAttention of moonshotai/Kimi-K3, unabsorbed, NoPE, with its sigmoid
+# output gate. RMSNorm weights are folded into the following projection, and
+# the 1/rms scale (Rq, Rk) is an extra operand of it. The score is the nope
+# part S1 plus the shared-rope part. Elementwise functions (rsqrt scale, exp,
+# sigmoid, 1/L) are written as products of their operands, which moves the
+# same data; Rq, Rk, the row max and row sum are reductions.
+#
+# Rank variables (ranks are the upper-case names): m = query token, n = key
+# token, hd = hidden, h = heads, ql = q lora rank, kl = kv lora rank,
+# dn = qk nope dim, dr = qk rope dim, dv = v dim, oh = output hidden.
+# The row max M of test_cases.py is renamed Smax, as M is a rank here.
+# As there, X is read over m by the query path and the gate, and over n
+# (X[M: n]) by the key/value path.
+# Set S (sequence length), HEADS, HIDDEN, Q_LORA, KV_LORA, QK_NOPE, QK_ROPE,
+# V_DIM.
+workload:
+  rank_sizes:
+    M: {{S}}
+    N: {{S}}
+    HD: {{HIDDEN}}
+    H: {{HEADS}}
+    QL: {{Q_LORA}}
+    KL: {{KV_LORA}}
+    DN: {{QK_NOPE}}
+    DR: {{QK_ROPE}}
+    DV: {{V_DIM}}
+    OH: {{HIDDEN}}
+  bits_per_value: {All: 8}
+  einsums:
+  # Query path: q_a_proj, q_a_layernorm, q_b_proj (nope and rope parts)
+  - "CQ[m, ql] = X[m, hd] * Wqa[hd, ql]"
+  - "Rq[m] = CQ[m, ql]"
+  - "QN[m, h, dn] = CQ[m, ql] * WqbN[ql, h, dn] * Rq[m]"
+  - "QR[m, h, dr] = CQ[m, ql] * WqbR[ql, h, dr] * Rq[m]"
+  # Key/value path: kv_a_proj_with_mqa (latent and shared rope parts),
+  # kv_a_layernorm, kv_b_proj (k nope and v parts)
+  - "CKV[n, kl] = X[M: n, hd] * Wkva[hd, kl]"
+  - "KR[n, dr] = X[M: n, hd] * Wkr[hd, dr]"
+  - "Rk[n] = CKV[n, kl]"
+  - "KN[n, h, dn] = CKV[n, kl] * WkbK[kl, h, dn] * Rk[n]"
+  - "V[n, h, dv] = CKV[n, kl] * WkbV[kl, h, dv] * Rk[n]"
+  # Attention: score (nope part, then the shared rope part), softmax, PV
+  - "S1[h, m, n] = QN[m, h, dn] * KN[n, h, dn]"
+  - "S[h, m, n] = S1[h, m, n] * QR[m, h, dr] * KR[n, dr]"
+  - "Smax[h, m] = S[h, m, n]"
+  - "P[h, m, n] = S[h, m, n] * Smax[h, m]"
+  - "L[h, m] = P[h, m, n]"
+  - "O[m, h, dv] = P[h, m, n] * V[n, h, dv] * L[h, m]"
+  # Output gate (g_proj, sigmoid), gating, o_proj
+  - "G[m, h, dv] = X[m, hd] * Wg[hd, h, dv]"
+  - "OG[m, h, dv] = O[m, h, dv] * G[m, h, dv]"
+  - "Y[m, oh] = OG[m, h, dv] * Wo[h, dv, oh]"

@@ -6,7 +6,9 @@ name -> function returning dict(einsums, capacity, global_outputs), with the
 sizes and capacity of the same-named case in cases.py.'''
 from common import REPO  # puts the repository on sys.path
 from siso_workload import siso_ssd_intra_chunk_einsums
-from test_cases import kda_full_batched_decode_einsums, llama_ffn_einsums
+from test_cases import (gdn_full_decode_einsums, gqa_attention_prefill_einsums,
+                        kda_full_batched_decode_einsums, kimi_k3_mla_einsums,
+                        llama_ffn_einsums)
 
 
 WORKLOADS = {
@@ -23,7 +25,19 @@ WORKLOADS = {
                                                 heads=96, a_rank=128),
         capacity=3 * 1024 * 1024,
         global_outputs=('S_t', 'k_lin_out', 'q_lin_out', 'v_lin_out', 'out')),
+    # test_cases.py's Test Case 12 (its __main__ arguments).
+    'gdn_decode': lambda: dict(
+        einsums=gdn_full_decode_einsums(hidden=1024, d_k=128, d_v=128, k_heads=16, v_heads=16,
+                                        conv_kernel=4),
+        capacity=3 * 1024 * 1024,
+        global_outputs=('S_t', 'k_lin_out', 'q_lin_out', 'v_lin_out', 'out')),
     'siso_k128': lambda: dict(
         einsums=siso_ssd_intra_chunk_einsums(Q=64, N=128, P=64, K=128),
         capacity=3 * 1024 * 1024),
+    # test_cases.py's Test Case 13 at Llama-3-8B's shapes.
+    'gqa_llama3_8b': lambda: dict(
+        einsums=gqa_attention_prefill_einsums(kv=8, g=4, s=1024, d=128),
+        capacity=3 * 1024 * 1024),
+    # test_cases.py's Test Case 14: Kimi K3's gated MLA block.
+    'kimi_k3_mla': lambda: dict(einsums=kimi_k3_mla_einsums(s=1024), capacity=3 * 1024 * 1024),
 }

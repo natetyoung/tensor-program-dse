@@ -18,7 +18,10 @@ Approximate times on a 16-core machine: FFM takes under 30 s per case
 except kda_batched (about 13 minutes). The DAG scheduler proves optimality
 within about 20 s except on attn512 and attn512_qfirst (about 6 minutes),
 and chain8 and kda_batched, which use the whole time limit. A full run
-(python run.py) takes about 1.5 hours.'''
+(python run.py) takes about 1.5 hours, plus the two attention cases below:
+on an 8-core machine with 4 threads, gqa_llama3_8b took 74 s in FFM and
+2 s to optimality in the DAG scheduler, and kimi_k3_mla 445 s in FFM (over
+6 GB of memory) and 186 s to optimality.'''
 
 CASES = {
     # Smoke tests: both tools finish in seconds.
@@ -63,6 +66,16 @@ CASES = {
                                'HEADS': 96, 'A_RANK': 128},
                         einsums=None, capacity=3 * 1024 * 1024,
                         global_outputs=['S_t', 'k_lin_out', 'q_lin_out', 'v_lin_out', 'out']),
+    # Test Case 12 of test_cases.py: Gated DeltaNet full decode, Qwen3.5-0.8B's
+    # linear-attention layers (hidden 1024, 16 key and 16 value heads of 128,
+    # conv kernel 4), batch 1, capacity 3 Mi (its __main__ arguments). As in
+    # kda_batched, the new state and the conv history (the *_lin_out) are
+    # global outputs.
+    'gdn_decode': dict(workload='workloads/gdn_decode.yaml',
+                       jinja={'HIDDEN': 1024, 'D_K': 128, 'D_V': 128, 'K_HEADS': 16,
+                              'V_HEADS': 16, 'CONV_KERNEL': 4},
+                       einsums=None, capacity=3 * 1024 * 1024,
+                       global_outputs=['S_t', 'k_lin_out', 'q_lin_out', 'v_lin_out', 'out']),
     # Mamba3 SISO SSD intra-chunk contribution (siso_workload.py, its
     # default Q 64, N 128, P 64, K 1). All its tensors total 65,920 elements
     # (compulsory traffic 28,928), so the capacity is swept from 4 Ki (tight)
@@ -89,4 +102,20 @@ CASES = {
                            jinja={'BATCH_SIZE': 1, 'DECODE': False, 'N_NEW_TOKENS': 512},
                            einsums=['V', 'K', 'Q', 'QK', 'QK_softmax', 'AV', 'Z'],
                            order=['I', 'V', 'Q', 'K'], capacity=1024 * 1024),
+    # Grouped-query attention prefill with softmax (workloads/
+    # gqa_attention_prefill.yaml, Test Case 13 of test_cases.py) at
+    # Llama-3-8B's shapes: 32 query heads in 8 KV groups of 4, head dim 128,
+    # 1024 tokens. S and P (32 Mi elements each) dwarf Q, K, V and O.
+    'gqa_llama3_8b': dict(workload='workloads/gqa_attention_prefill.yaml',
+                          jinja={'KV': 8, 'G': 4, 'S': 1024, 'D': 128},
+                          einsums=None, capacity=3 * 1024 * 1024),
+    # Kimi K3's gated multi-latent attention block (workloads/kimi_k3_mla.yaml,
+    # Test Case 14 of test_cases.py), prefill of 1024 tokens: 18 einsums,
+    # about 232 Mi elements of weights. X is reinterpreted: read over m by the
+    # query path and gate, and over n by the key/value path.
+    'kimi_k3_mla': dict(workload='workloads/kimi_k3_mla.yaml',
+                        jinja={'S': 1024, 'HEADS': 96, 'HIDDEN': 7168, 'Q_LORA': 1536,
+                               'KV_LORA': 512, 'QK_NOPE': 128, 'QK_ROPE': 64,
+                               'V_DIM': 128},
+                        einsums=None, capacity=3 * 1024 * 1024),
 }

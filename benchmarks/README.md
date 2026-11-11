@@ -34,7 +34,7 @@ Run these from this folder:
 ```
 python run.py --list                       # the cases
 python run.py chain2_tiny siso_c4k         # some cases (about a minute)
-python run.py                              # every case (about 1.5 h on 16 cores)
+python run.py                              # every case (about 1.75 h on 16 cores)
 ```
 
 `run.py` writes `results/summary.md` at the end and prints it. For each case it runs four steps, each in its own process, so a failure in one step doesn't stop the rest:
@@ -106,12 +106,15 @@ With `--measure-memory`, `run.py` and `einsum_run.py` run each tool step in its 
 - **Sanity check:** `invalid_reduction_loops` in the DAG results must be empty. It lists any loop that would make a consumer read a partial sum; the summary flags any it finds.
 
 ## Core counts, with compute costs
-`python cores.py` runs the DAG scheduler alone, with no FFM, on `swiglu`, `kda_batched` and `siso_k128`.
+`python cores.py` runs the DAG scheduler alone, with no FFM, on `swiglu`, `kda_batched`, `gdn_decode`, `siso_k128`, `gqa_llama3_8b` and `kimi_k3_mla`.
 - **Core counts:** each case runs with `num_cores` = 1 and 8, the hardware cores a schedule may split loops across.
-- **Time limit:** every run gets the same limit, 30 minutes by default, so all six runs take up to 3 hours.
+- **Time limit:** every run gets the same limit, 30 minutes by default, so all twelve runs take up to 6 hours.
 - **Compute costs:** unlike the FFM comparison, these workloads use this repository's Python descriptions with their `compute_cost`, `accel_gran` and `operation` (`compute_workloads.py`):
   - `kda_batched` is `test_cases.kda_full_batched_decode_einsums`;
+  - `gdn_decode` is `test_cases.gdn_full_decode_einsums`;
   - `siso_k128` is `siso_workload.siso_ssd_intra_chunk_einsums`;
+  - `gqa_llama3_8b` is `test_cases.gqa_attention_prefill_einsums`;
+  - `kimi_k3_mla` is `test_cases.kimi_k3_mla_einsums`;
   - `swiglu` is `test_cases.llama_ffn_einsums`. The merged variant isn't used: with compute costs, its model overflows CP-SAT's 64-bit objective, as `compute_workloads.py` explains.
 - **Objective:** with compute costs, it is 5 × max(compute, traffic) + compute + traffic. Both traffic and compute are per core.
 - **Output:** `results/<case>/compute_cores<N>.{json,txt}`, separate from the comparison's `dag*.json`, and `results/compute_cores_report.md`, which has a table of all runs followed by each schedule's loop nest.

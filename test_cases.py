@@ -256,7 +256,7 @@ feed_forward_einsums = [
 # Y_gate(bs, d_ff) -> Y_act(bs, d_ff) (elementwise activation)
 # Y_up(bs, d_ff) * Y_act(bs, d_ff) -> Y_mid(bs, d_ff) (elementwise multiplication)
 # Y_mid(bs, d_ff) * W_down(d_ff, h) -> Z(bs, h)
-def llama_ffn_einsums(bs=128, h=2880, d_ff=2880, num_exp=1):
+def llama_ffn_einsums(bs=128, h=2880, d_ff=2880, num_exp=1, compute_cost=True):
     return [
         Einsum(
             operand_dims={
@@ -267,7 +267,7 @@ def llama_ffn_einsums(bs=128, h=2880, d_ff=2880, num_exp=1):
             output_operand='Y_up',
             dim_sizes={'bs': bs, 'h': h, 'd_ff': d_ff, 'e': num_exp},
             accel_gran={'bs': 128, 'h': 128, 'd_ff': 512, 'e': 1},
-            compute_cost=70710,
+            compute_cost=70710 if compute_cost else 0,
             operation='matmul'
         ),
         Einsum(
@@ -279,7 +279,7 @@ def llama_ffn_einsums(bs=128, h=2880, d_ff=2880, num_exp=1):
             output_operand='Y_gate',
             dim_sizes={'bs': bs, 'h': h, 'd_ff': d_ff, 'e': num_exp},
             accel_gran={'bs': 128, 'h': 128, 'd_ff': 512, 'e': 1},
-            compute_cost=70710,
+            compute_cost=70710 if compute_cost else 0,
             operation='matmul'
         ),
         # Einsum(
@@ -302,7 +302,7 @@ def llama_ffn_einsums(bs=128, h=2880, d_ff=2880, num_exp=1):
             output_operand='Y_mid',
             dim_sizes={'bs': bs, 'd_ff': d_ff, 'e': num_exp},
             accel_gran={'PRODUCT': 128},
-            compute_cost=44,
+            compute_cost=44 if compute_cost else 0,
             operation='elemwise_mul(linear_gate(Y_up),sigmoid(alpha*clamp(Y_gate)))'
         ),
         Einsum(
@@ -314,7 +314,7 @@ def llama_ffn_einsums(bs=128, h=2880, d_ff=2880, num_exp=1):
             output_operand='Z',
             dim_sizes={'bs': bs, 'h1': h, 'd_ff': d_ff, 'e': num_exp},
             accel_gran={'bs': 128, 'h1': 512, 'd_ff': 128, 'e': 1},
-            compute_cost=70710,
+            compute_cost=70710 if compute_cost else 0,
             operation='matmul'
         )
     ]
@@ -1224,6 +1224,199 @@ def kda_full_batched_decode_einsums(batch=32, hidden=7168, d_k=128, d_v=128, hea
     return einsums
 
 
+def attn_prefill(heads, s, d):
+    return [
+        Einsum({'Q': ('hd','m','d'), 'K': ('hd','n','d'), 'S': ('hd','m','n')}, 'S',
+               {'hd': heads, 'm': s, 'n': s, 'd': d}, operation='matmul'),
+        Einsum({'S': ('hd','m','n'), 'P': ('hd','m','n')}, 'P',
+               {'hd': heads, 'm': s, 'n': s}, operation='exp'),
+        Einsum({'P': ('hd','m','n'), 'L': ('hd','m')}, 'L',
+               {'hd': heads, 'm': s, 'n': s}, operation='sum'),
+        Einsum({'P': ('hd','m','n'), 'V': ('hd','n','d'), 'L': ('hd','m'), 'O': ('hd','m','d')}, 'O',
+               {'hd': heads, 'm': s, 'n': s, 'd': d}, operation='matmul_scale'),
+    ]
+
+# Test Case 13: GQA attention prefill with softmax (defaults: Llama-3-8B, 32
+# query heads in 8 KV groups of 4, head dim 128, seq 1024).
+# Q(kv, g, m, d) * K(kv, n, d) -> S(kv, g, m, n)
+# S(kv, g, m, n) -> M(kv, g, m)                       (row max)
+# S(kv, g, m, n), M(kv, g, m) -> P(kv, g, m, n)       (exp(S - M))
+# P(kv, g, m, n) -> L(kv, g, m)                       (row sum)
+# P(kv, g, m, n) * V(kv, n, d), L(kv, g, m) -> O(kv, g, m, d)  (matmul, scale by 1/L)
+# Heuristic (epilogue-fusion) groups: [[0, 1], [2, 3], [4]].
+def gqa_attention_prefill_einsums(kv=8, g=4, s=1024, d=128, compute_cost=True):
+    mm_gran = {('g', 'm'): 512, 'n': 128, 'd': 128, 'kv': 1}
+    return [
+        Einsum(
+            operand_dims={
+                'Q': ('kv', 'g', 'm', 'd'),
+                'K': ('kv', 'n', 'd'),
+                'S': ('kv', 'g', 'm', 'n'),
+            },
+            output_operand='S',
+            dim_sizes={'kv': kv, 'g': g, 'm': s, 'n': s, 'd': d},
+            accel_gran=mm_gran,
+            compute_cost=70710 if compute_cost else 0,
+            operation='matmul'
+        ),
+        Einsum(
+            operand_dims={
+                'S': ('kv', 'g', 'm', 'n'),
+                'M': ('kv', 'g', 'm'),
+            },
+            output_operand='M',
+            dim_sizes={'kv': kv, 'g': g, 'm': s, 'n': s},
+            accel_gran={'PRODUCT': 128},
+            compute_cost=22 if compute_cost else 0,
+            operation='rowmax'
+        ),
+        Einsum(
+            operand_dims={
+                'S': ('kv', 'g', 'm', 'n'),
+                'M': ('kv', 'g', 'm'),
+                'P': ('kv', 'g', 'm', 'n'),
+            },
+            output_operand='P',
+            dim_sizes={'kv': kv, 'g': g, 'm': s, 'n': s},
+            accel_gran={'PRODUCT': 128},
+            compute_cost=22 if compute_cost else 0,
+            operation='exp(S-M)'
+        ),
+        Einsum(
+            operand_dims={
+                'P': ('kv', 'g', 'm', 'n'),
+                'L': ('kv', 'g', 'm'),
+            },
+            output_operand='L',
+            dim_sizes={'kv': kv, 'g': g, 'm': s, 'n': s},
+            accel_gran={'PRODUCT': 128},
+            compute_cost=22 if compute_cost else 0,
+            operation='rowsum'
+        ),
+        Einsum(
+            operand_dims={
+                'P': ('kv', 'g', 'm', 'n'),
+                'V': ('kv', 'n', 'd'),
+                'L': ('kv', 'g', 'm'),
+                'O': ('kv', 'g', 'm', 'd'),
+            },
+            output_operand='O',
+            dim_sizes={'kv': kv, 'g': g, 'm': s, 'n': s, 'd': d},
+            accel_gran=mm_gran,
+            compute_cost=70710 if compute_cost else 0,
+            operation='matmul_scale'
+        ),
+    ]
+
+# Test Case 14: Kimi K3 gated multi-latent attention (MLA) block, prefill
+# (KimiMLAAttention in moonshotai/Kimi-K3's modeling_kimi_linear.py, on the
+# 24 non-KDA layers; defaults from its config.json, seq 1024). Unabsorbed MLA,
+# NoPE (the rope slice is not rotated), sigmoid output gate. RMSNorm weights
+# are folded into the following projection and the 1/rms scale is applied
+# after it (it commutes with the matmul). The score is split into its nope and
+# shared-rope parts, since concatenation is not an einsum. Causal masking is
+# not modelled. Dims: m / n = query / key tokens, hd = hidden, h = heads,
+# ql / kl = q / kv lora rank, dn = qk nope dim, dr = qk rope dim, dv = v dim,
+# oh = output hidden.
+# X(m, hd) * Wqa(hd, ql) -> CQ(m, ql);  CQ -> Rq(m)  (sum of squares)
+# CQ * WqbN(ql, h, dn), Rq -> QN(m, h, dn);  CQ * WqbR(ql, h, dr), Rq -> QR(m, h, dr)
+# X(n, hd) * Wkva(hd, kl) -> CKV(n, kl);  X(n, hd) * Wkr(hd, dr) -> KR(n, dr)
+# CKV -> Rk(n);  CKV * WkbK(kl, h, dn), Rk -> KN(n, h, dn);  CKV * WkbV(kl, h, dv), Rk -> V(n, h, dv)
+# QN * KN -> S1(h, m, n);  S1, QR * KR -> S(h, m, n)
+# S -> M(h, m) (row max);  S, M -> P (exp(S - M));  P -> L(h, m) (row sum)
+# P * V, L -> O(m, h, dv)  (matmul, scale by 1/L)
+# X(m, hd) * Wg(hd, h, dv) -> G (sigmoid);  O * G -> OG;  OG * Wo(h, dv, oh) -> Y(m, oh)
+# Heuristic (epilogue-fusion) groups:
+# [[0, 1], [2, 3], [4, 5, 6], [7, 8], [9, 10, 11], [12, 13], [15], [14, 16], [17]].
+def kimi_k3_mla_einsums(s=1024, heads=96, hidden=7168, q_lora=1536, kv_lora=512,
+                        qk_nope=128, qk_rope=64, v_dim=128, compute_cost=True):
+    sizes = {'m': s, 'n': s, 'h': heads, 'hd': hidden, 'oh': hidden, 'ql': q_lora,
+             'kl': kv_lora, 'dn': qk_nope, 'dr': qk_rope, 'dv': v_dim}
+    dims = lambda *ds: {d: sizes[d] for d in ds}
+    mm = 70710 if compute_cost else 0
+    sc = 22 if compute_cost else 0
+    return [
+        # Query path: q_a_proj, q_a_layernorm, q_b_proj (nope and rope parts)
+        Einsum(operand_dims={'X': ('m', 'hd'), 'Wqa': ('hd', 'ql'), 'CQ': ('m', 'ql')},
+               output_operand='CQ', dim_sizes=dims('m', 'hd', 'ql'),
+               accel_gran={'m': 128, 'hd': 128, 'ql': 512}, compute_cost=mm,
+               operation='matmul'),
+        Einsum(operand_dims={'CQ': ('m', 'ql'), 'Rq': ('m',)},
+               output_operand='Rq', dim_sizes=dims('m', 'ql'),
+               accel_gran={'PRODUCT': 128}, compute_cost=sc, operation='sumsq'),
+        Einsum(operand_dims={'CQ': ('m', 'ql'), 'WqbN': ('ql', 'h', 'dn'), 'Rq': ('m',),
+                             'QN': ('m', 'h', 'dn')},
+               output_operand='QN', dim_sizes=dims('m', 'ql', 'h', 'dn'),
+               accel_gran={'m': 128, 'ql': 128, ('h', 'dn'): 512}, compute_cost=mm,
+               operation='matmul_rsqrt_scale'),
+        Einsum(operand_dims={'CQ': ('m', 'ql'), 'WqbR': ('ql', 'h', 'dr'), 'Rq': ('m',),
+                             'QR': ('m', 'h', 'dr')},
+               output_operand='QR', dim_sizes=dims('m', 'ql', 'h', 'dr'),
+               accel_gran={'m': 128, 'ql': 128, ('h', 'dr'): 512}, compute_cost=mm,
+               operation='matmul_rsqrt_scale'),
+        # Key/value path: kv_a_proj_with_mqa (latent and shared rope parts),
+        # kv_a_layernorm, kv_b_proj (k nope and v parts)
+        Einsum(operand_dims={'X': ('n', 'hd'), 'Wkva': ('hd', 'kl'), 'CKV': ('n', 'kl')},
+               output_operand='CKV', dim_sizes=dims('n', 'hd', 'kl'),
+               accel_gran={'n': 128, 'hd': 128, 'kl': 512}, compute_cost=mm,
+               operation='matmul'),
+        Einsum(operand_dims={'X': ('n', 'hd'), 'Wkr': ('hd', 'dr'), 'KR': ('n', 'dr')},
+               output_operand='KR', dim_sizes=dims('n', 'hd', 'dr'),
+               accel_gran={'n': 128, 'hd': 128, 'dr': 512}, compute_cost=mm,
+               operation='matmul'),
+        Einsum(operand_dims={'CKV': ('n', 'kl'), 'Rk': ('n',)},
+               output_operand='Rk', dim_sizes=dims('n', 'kl'),
+               accel_gran={'PRODUCT': 128}, compute_cost=sc, operation='sumsq'),
+        Einsum(operand_dims={'CKV': ('n', 'kl'), 'WkbK': ('kl', 'h', 'dn'), 'Rk': ('n',),
+                             'KN': ('n', 'h', 'dn')},
+               output_operand='KN', dim_sizes=dims('n', 'kl', 'h', 'dn'),
+               accel_gran={'n': 128, 'kl': 128, ('h', 'dn'): 512}, compute_cost=mm,
+               operation='matmul_rsqrt_scale'),
+        Einsum(operand_dims={'CKV': ('n', 'kl'), 'WkbV': ('kl', 'h', 'dv'), 'Rk': ('n',),
+                             'V': ('n', 'h', 'dv')},
+               output_operand='V', dim_sizes=dims('n', 'kl', 'h', 'dv'),
+               accel_gran={'n': 128, 'kl': 128, ('h', 'dv'): 512}, compute_cost=mm,
+               operation='matmul_rsqrt_scale'),
+        # Attention: score (nope part, then the shared rope part), softmax, PV
+        Einsum(operand_dims={'QN': ('m', 'h', 'dn'), 'KN': ('n', 'h', 'dn'),
+                             'S1': ('h', 'm', 'n')},
+               output_operand='S1', dim_sizes=dims('h', 'm', 'n', 'dn'),
+               accel_gran={'m': 512, 'n': 128, 'dn': 128, 'h': 1}, compute_cost=mm,
+               operation='matmul'),
+        Einsum(operand_dims={'S1': ('h', 'm', 'n'), 'QR': ('m', 'h', 'dr'), 'KR': ('n', 'dr'),
+                             'S': ('h', 'm', 'n')},
+               output_operand='S', dim_sizes=dims('h', 'm', 'n', 'dr'),
+               accel_gran={'m': 512, 'n': 128, 'dr': 128, 'h': 1}, compute_cost=mm,
+               operation='matmul_add'),
+        Einsum(operand_dims={'S': ('h', 'm', 'n'), 'M': ('h', 'm')},
+               output_operand='M', dim_sizes=dims('h', 'm', 'n'),
+               accel_gran={'PRODUCT': 128}, compute_cost=sc, operation='rowmax'),
+        Einsum(operand_dims={'S': ('h', 'm', 'n'), 'M': ('h', 'm'), 'P': ('h', 'm', 'n')},
+               output_operand='P', dim_sizes=dims('h', 'm', 'n'),
+               accel_gran={'PRODUCT': 128}, compute_cost=sc, operation='exp(S-M)'),
+        Einsum(operand_dims={'P': ('h', 'm', 'n'), 'L': ('h', 'm')},
+               output_operand='L', dim_sizes=dims('h', 'm', 'n'),
+               accel_gran={'PRODUCT': 128}, compute_cost=sc, operation='rowsum'),
+        Einsum(operand_dims={'P': ('h', 'm', 'n'), 'V': ('n', 'h', 'dv'), 'L': ('h', 'm'),
+                             'O': ('m', 'h', 'dv')},
+               output_operand='O', dim_sizes=dims('h', 'm', 'n', 'dv'),
+               accel_gran={'m': 512, 'n': 128, 'dv': 128, 'h': 1}, compute_cost=mm,
+               operation='matmul_scale'),
+        # Output gate (g_proj, sigmoid), gating, o_proj
+        Einsum(operand_dims={'X': ('m', 'hd'), 'Wg': ('hd', 'h', 'dv'), 'G': ('m', 'h', 'dv')},
+               output_operand='G', dim_sizes=dims('m', 'hd', 'h', 'dv'),
+               accel_gran={'m': 128, 'hd': 128, ('h', 'dv'): 512}, compute_cost=mm,
+               operation='matmul_sigmoid'),
+        Einsum(operand_dims={'O': ('m', 'h', 'dv'), 'G': ('m', 'h', 'dv'),
+                             'OG': ('m', 'h', 'dv')},
+               output_operand='OG', dim_sizes=dims('m', 'h', 'dv'),
+               accel_gran={'PRODUCT': 128}, compute_cost=sc, operation='mul'),
+        Einsum(operand_dims={'OG': ('m', 'h', 'dv'), 'Wo': ('h', 'dv', 'oh'), 'Y': ('m', 'oh')},
+               output_operand='Y', dim_sizes=dims('m', 'h', 'dv', 'oh'),
+               accel_gran={'m': 128, ('h', 'dv'): 128, 'oh': 512}, compute_cost=mm,
+               operation='matmul'),
+    ]
+
 def einsum_by_einsum_scheduler(
     einsums: List[Einsum],
     capacity: int,
@@ -1271,8 +1464,10 @@ if __name__ == '__main__':
     print("Running Test Case 6: Llama-style Feed-Forward Network (SwiGLU)")
     print("=========================================")
     scheduler(llama_ffn_einsums(1024, 7168, 3072, num_exp=6), capacity=6 * 1024 * 1024, num_cores=1, allow_spilling=True)
+    # scheduler(llama_ffn_einsums(1024, 7168, 3072, num_exp=6), capacity=6 * 1024 * 1024, num_cores=1, allow_spilling=True, perfect_factorization=True, partial_sums=True, sparse_domains=True)
     einsum_by_einsum_scheduler(llama_ffn_einsums(1024, 7168, 3072, num_exp=6), capacity=6 * 1024 * 1024, num_cores=1, allow_spilling=True)
-    scheduler(llama_ffn_einsums(64 * 1024, 1024, 2048, num_exp=1), capacity=3 * 1024 * 1024, num_cores=8, allow_spilling=True)
+    scheduler(llama_ffn_einsums(16, 4096, 14336, num_exp=1, compute_cost=False), capacity=128 * 1024, num_cores=1, allow_spilling=True, perfect_factorization=True, partial_sums=True, sparse_domains=True)
+    # einsum_by_einsum_scheduler(llama_ffn_einsums(16, 4096, 14336, num_exp=1, compute_cost=False), capacity=128 * 1024, num_cores=1, allow_spilling=True)
     einsum_by_einsum_scheduler(llama_ffn_einsums(16 * 1024, 1024, 2048, num_exp=1), capacity=3 * 1024 * 1024, num_cores=8, allow_spilling=True)
     # scheduler(
     #     llama_ffn_einsums(64 * 1024, 1024, 2048, num_exp=1),
@@ -1340,3 +1535,10 @@ if __name__ == '__main__':
     # )
     # end_time = time.process_time()
     # print("Execution time:", end_time - start_time, "seconds")
+
+    # print("=========================================")
+    # print("Running Test Case 13: GQA Attention Prefill (Llama-3-8B)")
+    # print("=========================================")
+    # scheduler(gqa_attention_prefill_einsums(), capacity=3 * 1024 * 1024, num_cores=1, allow_spilling=True)
+
+    # scheduler(attn_prefill(32, 4096, 128), num_cores=1, capacity=3 * 1024 * 1024, allow_spilling=True, perfect_factorization=True, partial_sums=True, sparse_domains=True)

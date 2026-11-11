@@ -1,0 +1,24 @@
+# Grouped-query attention prefill with softmax, mirroring
+# tensor-program-dse/test_cases.py: gqa_attention_prefill_einsums (Test Case
+# 13). Query heads come in KV groups of G that share K and V. Elementwise
+# functions (exp, the 1/L scale) are written as products of their operands,
+# which moves the same data; the row max and row sum are reductions.
+#
+# Rank variables (ranks are the upper-case names): kv = KV head, g = query
+# head within its group, m = query token, n = key token, d = head dim.
+# The row max M of test_cases.py is renamed Smax, as M is a rank here.
+# Set KV, G, S (sequence length), D.
+workload:
+  rank_sizes:
+    KV: {{KV}}
+    G: {{G}}
+    M: {{S}}
+    N: {{S}}
+    D: {{D}}
+  bits_per_value: {All: 8}
+  einsums:
+  - "S[kv, g, m, n] = Q[kv, g, m, d] * K[kv, n, d]"
+  - "Smax[kv, g, m] = S[kv, g, m, n]"
+  - "P[kv, g, m, n] = S[kv, g, m, n] * Smax[kv, g, m]"
+  - "L[kv, g, m] = P[kv, g, m, n]"
+  - "O[kv, g, m, d] = P[kv, g, m, n] * V[kv, n, d] * L[kv, g, m]"
