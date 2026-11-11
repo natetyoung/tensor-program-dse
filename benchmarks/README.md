@@ -111,7 +111,7 @@ With `--measure-memory`, `run.py` and `einsum_run.py` run each tool step in its 
 - **Time limit:** every run gets the same limit, 30 minutes by default, so all twelve runs take up to 6 hours.
 - **Compute costs:** unlike the FFM comparison, these workloads use this repository's Python descriptions with their `compute_cost`, `accel_gran` and `operation` (`compute_workloads.py`):
   - `kda_batched` is `test_cases.kda_full_batched_decode_einsums`;
-  - `gdn_decode` is `test_cases.gdn_full_decode_einsums`;
+  - `gdn_decode` is `test_cases.gdn_core_gated_decode_einsums`;
   - `siso_k128` is `siso_workload.siso_ssd_intra_chunk_einsums`;
   - `gqa_llama3_8b` is `test_cases.gqa_attention_prefill_einsums`;
   - `kimi_k3_mla` is `test_cases.kimi_k3_mla_einsums`;

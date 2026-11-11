@@ -37,19 +37,21 @@ CASES = {
        for n in (2, 4, 8)},
     # SwiGLU FFN (workloads/swiglu_ffn.yaml), the two setups of
     # test_cases.py: X feeds the up and gate projections, which meet in
-    # Y_mid, then the down projection reduces over f and e.
+    # Y_mid, then the down projection reduces over f and e. swiglu (and
+    # swiglu_merged) is one DeepSeek-V4-Pro routed expert (hidden 7168,
+    # moe_intermediate_size 3072) at a batch of 2048 tokens.
     'swiglu_e6': dict(workload='workloads/swiglu_ffn.yaml',
                       jinja={'BS': 1024, 'H': 7168, 'D_FF': 3072, 'N_EXP': 6},
                       einsums=None, capacity=6 * 1024 * 1024),
     'swiglu': dict(workload='workloads/swiglu_ffn.yaml',
-                   jinja={'BS': 64 * 1024, 'H': 1024, 'D_FF': 2048, 'N_EXP': 1},
+                   jinja={'BS': 2048, 'H': 7168, 'D_FF': 3072, 'N_EXP': 1},
                    einsums=None, capacity=3 * 1024 * 1024),
     # The same with up and gate merged into one einsum over u.
     'swiglu_e6_merged': dict(workload='workloads/swiglu_ffn_merged.yaml',
                              jinja={'BS': 1024, 'H': 7168, 'D_FF': 3072, 'N_EXP': 6},
                              einsums=None, capacity=6 * 1024 * 1024),
     'swiglu_merged': dict(workload='workloads/swiglu_ffn_merged.yaml',
-                          jinja={'BS': 64 * 1024, 'H': 1024, 'D_FF': 2048, 'N_EXP': 1},
+                          jinja={'BS': 2048, 'H': 7168, 'D_FF': 3072, 'N_EXP': 1},
                           einsums=None, capacity=3 * 1024 * 1024),
     # Test Cases 1-3 of test_cases.py, at the capacities its __main__ uses.
     'shared_input': dict(workload='workloads/shared_input.yaml', jinja={}, einsums=None,
@@ -66,16 +68,16 @@ CASES = {
                                'HEADS': 96, 'A_RANK': 128},
                         einsums=None, capacity=3 * 1024 * 1024,
                         global_outputs=['S_t', 'k_lin_out', 'q_lin_out', 'v_lin_out', 'out']),
-    # Test Case 12 of test_cases.py: Gated DeltaNet full decode, Qwen3.5-0.8B's
-    # linear-attention layers (hidden 1024, 16 key and 16 value heads of 128,
-    # conv kernel 4), batch 1, capacity 3 Mi (its __main__ arguments). As in
-    # kda_batched, the new state and the conv history (the *_lin_out) are
-    # global outputs.
+    # Test Case 15 of test_cases.py: Gated DeltaNet core decode with its gate
+    # and gated RMSNorm output (what gdn_nki_kernel.py computes), at
+    # Qwen3.5-35B-A3B's linear-attention layers (16 key heads and 32 value
+    # heads of 128, so 2 value heads per key head), batch 128, capacity 3 Mi.
+    # S_prev and S_t are 64 Mi elements each, so the state must be tiled.
+    # The new state S_t, also read by o, is a global output.
     'gdn_decode': dict(workload='workloads/gdn_decode.yaml',
-                       jinja={'HIDDEN': 1024, 'D_K': 128, 'D_V': 128, 'K_HEADS': 16,
-                              'V_HEADS': 16, 'CONV_KERNEL': 4},
-                       einsums=None, capacity=3 * 1024 * 1024,
-                       global_outputs=['S_t', 'k_lin_out', 'q_lin_out', 'v_lin_out', 'out']),
+                       jinja={'BATCH': 128, 'D_K': 128, 'D_V': 128, 'K_HEADS': 16,
+                              'V_HEADS': 32},
+                       einsums=None, capacity=3 * 1024 * 1024, global_outputs=['S_t']),
     # Mamba3 SISO SSD intra-chunk contribution (siso_workload.py, its
     # default Q 64, N 128, P 64, K 1). All its tensors total 65,920 elements
     # (compulsory traffic 28,928), so the capacity is swept from 4 Ki (tight)
