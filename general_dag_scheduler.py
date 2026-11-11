@@ -26,6 +26,8 @@ Internal organisation
                                  solve → print_schedule, returns (sm, solver).
 """
 
+import contextlib
+import io
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -1317,13 +1319,21 @@ def _tile_einsum(e: Einsum, capacity: int, time_limit: Optional[float],
                  num_workers: Optional[int]):
     """
     Tile one uniquified einsum on its own with cb_einsum_ml (one on-chip
-    level of the given capacity, off-chip traffic as its energy).  Returns
-    (order, factors): operands outermost first (placements 0 .. n-1), and
-    per dim the factors in n + 1 buckets, bucket p directly above placement
-    p and bucket n below every buffer; or None if no tiling was found.
-    cb_einsum_ml's enforce_optimal_placement (on by default) only puts a
-    loop over a dim in the bucket above an operand having it, so a node
-    never loops over a dim none of its operands has, as this model requires.
+    level of the given capacity, off-chip traffic as its energy; compute is
+    ignored).  Returns its (anc, temporal, spatial, parallel) keyed by e's
+    operand names, as taken by _add_unfused_hints, or None if no tiling was
+    found.
+
+    cb_einsum_ml gives the operands outermost first (placements 0 .. n-1)
+    and per dim the factors in n + 1 buckets, bucket p directly above
+    placement p and bucket n below every buffer; placements with no loops
+    between them share a node.  Its enforce_optimal_placement (on by
+    default) only puts a loop over a dim in the bucket above an operand
+    having it, so a node never loops over a dim none of its operands has,
+    as this model requires.  As in the model, a tile is ceil(size / product
+    of the loops above it); each loop factor f is snapped to
+    ceil(size / ceil(size / f)) <= f, which is in the sparse domain and
+    leaves every tile unchanged (the identity under perfect factorization).
     """
     sched = cbml.cb_einsum_ml(
         e.operand_dims, e.output_operand, e.dim_sizes, capacity,
@@ -1335,37 +1345,62 @@ def _tile_einsum(e: Einsum, capacity: int, time_limit: Optional[float],
         **({} if time_limit is None else {'time_limit': time_limit}))
     if sched is None:
         return None
-    return [u.op for u in sched.order], {d: list(f) for d, f in sched.factors.items()}
+    order = [u.op for u in sched.order]
+    factors = {d: list(f) for d, f in sched.factors.items()}
+    # A node's anchor is its first operand in the model's operand order,
+    # which within one einsum is e's operand order.
+    rank = {op: i for i, op in enumerate(e.operand_dims)}
+    size = e.dim_sizes
+    snap = lambda d, f: -(-size[d] // -(-size[d] // f))
+    n = len(order)
+    node = []  # node[p]: placement of the first operand of p's node
+    for p in range(n):
+        node.append(node[-1] if p and all(f[p] == 1 for f in factors.values()) else p)
+    anc = {(order[p], order[q]): int(node[p] <= node[q]) for p in range(n) for q in range(n)}
+    temporal, spatial = {}, {}
+    for p, op in enumerate(order):
+        peers = [order[q] for q in range(n) if node[q] == node[p]]
+        anchor = min(peers, key=rank.__getitem__) == op
+        temporal[op] = {d: snap(d, f[node[p]]) if anchor else 1 for d, f in factors.items()}
+        spatial[op] = {d: -(-size[d] // prod(snap(d, f) for f in factors[d][:p + 1]))
+                       for d in e.operand_dims[op]}
+    return anc, temporal, spatial, {op: {} for op in order}
 
 
-def _build_tiling_hints(sm: SchedulerModel, tilings) -> None:
+def _solve_einsum_alone(e: Einsum, capacity: int, time_limit: Optional[float], **kwargs):
     """
-    Hint the complete unfused schedule made of one tree per einsum, from
-    single-einsum tilings (one (order, factors) per einsum of sm.einsums;
-    placements with no loops between them share a node).  As in the model, a tile is ceil(size / product of the loops
-    above it); each loop factor f is snapped to ceil(size / ceil(size / f))
-    <= f, which is in the sparse domain and leaves every tile unchanged (the
-    identity under perfect factorization).  Across einsums every ancestor
-    relation is 0, every fusion 0, every transfer 1.
+    Schedule one uniquified einsum on its own with scheduler(), which, unlike
+    _tile_einsum, accounts for compute cost.  Returns its solved
+    (anc, temporal, spatial, parallel) keyed by e's operand names, as taken
+    by _add_unfused_hints, or None if no schedule was found.  kwargs are
+    passed on to scheduler().
+    """
+    with contextlib.redirect_stdout(io.StringIO()):  # scheduler() always prints
+        sub, solver = scheduler([e], capacity, debug=False, time_limit=time_limit, **kwargs)
+    if solver.response_proto.status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None
+    name = sub.original_names  # sub's operand -> e's operand
+    val = lambda vs: {d: solver.Value(v) for d, v in vs.items()}
+    anc = {(name[i], name[j]): solver.Value(sub.ancestor[i][j])
+           for i in sub.all_operands for j in sub.all_operands}
+    return (anc,
+            {name[i]: val(sub.temporal_dim[i]) for i in sub.all_operands},
+            {name[i]: val(sub.spatial_dim[i]) for i in sub.all_operands},
+            {name[i]: val(sub.parallel_dim[i]) for i in sub.all_operands})
+
+
+def _add_unfused_hints(sm: SchedulerModel, hints) -> None:
+    """
+    Hint the complete unfused schedule made of one tree per einsum, given one
+    (anc, temporal, spatial, parallel) per einsum of sm.einsums, as returned
+    by _tile_einsum or _solve_einsum_alone: the ancestor relations among the
+    einsum's operands (anc[(i, j)]) and every operand's factors (a parallel
+    factor left out is 1).  Across einsums every ancestor relation is 0,
+    every fusion 0, every transfer 1.
     """
     model, ops = sm.model, sm.all_operands
-    rank = {op: i for i, op in enumerate(ops)}
-    anc, temporal, spatial = {}, {}, {}
-    for e, (order, factors) in zip(sm.einsums, tilings):
-        size = e.dim_sizes
-        snap = lambda d, f: -(-size[d] // -(-size[d] // f))
-        n = len(order)
-        node = []  # node[p]: placement of the first operand of p's node
-        for p in range(n):
-            node.append(node[-1] if p and all(f[p] == 1 for f in factors.values()) else p)
-        anc.update({(order[p], order[q]): int(node[p] <= node[q])
-                    for p in range(n) for q in range(n)})
-        for p, op in enumerate(order):
-            peers = [order[q] for q in range(n) if node[q] == node[p]]
-            anchor = min(peers, key=rank.__getitem__) == op
-            temporal[op] = {d: snap(d, f[node[p]]) if anchor else 1 for d, f in factors.items()}
-            spatial[op] = {d: -(-size[d] // prod(snap(d, f) for f in factors[d][:p + 1]))
-                           for d in e.operand_dims[op]}
+    anc, temporal, spatial, parallel = (
+        {k: v for h in hints for k, v in h[part].items()} for part in range(4))
     for i in ops:
         for j in ops:
             a = anc.get((i, j), 0)
@@ -1376,8 +1411,8 @@ def _build_tiling_hints(sm: SchedulerModel, tilings) -> None:
             anc.get((i, j), 0) and anc.get((j, i), 0) for j in ops[:k])))
         for d, v in sm.temporal_dim[i].items():
             model.AddHint(v, temporal[i].get(d, 1))
-        for v in sm.parallel_dim[i].values():
-            model.AddHint(v, 1)
+        for d, v in sm.parallel_dim[i].items():
+            model.AddHint(v, parallel[i].get(d, 1))
         for d, v in sm.spatial_dim[i].items():
             model.AddHint(v, spatial[i][d])
     for v in list(sm.must_write.values()) + list(sm.must_read.values()):
@@ -1737,7 +1772,9 @@ def scheduler(
                                choosing optimal capacity to minimize final delay
                                subject to area budget.
     hint                     : If True, first tile each einsum on its own
-                               with cb_einsum_ml_cpsat97 and give the
+                               with cb_einsum_ml_cpsat97 (or, if it has a
+                               compute cost, with scheduler() itself, since
+                               cb_einsum_ml ignores compute) and give the
                                resulting unfused schedule to CP-SAT as a
                                solution hint.  The tiling gets at most a
                                tenth of time_limit (shared over the einsums),
@@ -1815,16 +1852,29 @@ def scheduler(
         raise ValueError(f"CP-SAT model is invalid: {invalid}")
     if hint:
         t0 = time.perf_counter()
-        tilings = []
+        hints = []
         for k, e in enumerate(sm.einsums):
             limit = None
             if time_limit is not None:  # leftover passed on to later einsums
                 limit = max((0.1 * time_limit - (time.perf_counter() - t0))
                             / (len(sm.einsums) - k), 1e-3)
-            tilings.append(_tile_einsum(e, sm.capacity, limit, perfect_factorization,
-                                        partial_sums, num_workers))
-        if None not in tilings:
-            _build_tiling_hints(sm, tilings)
+            if e.compute_cost > 0:
+                # _tile_einsum minimises traffic alone, so its tiling can be
+                # far from optimal here (tiny tiles, each costing a full
+                # accelerator step); schedule the einsum with scheduler().
+                hints.append(_solve_einsum_alone(
+                    e, sm.capacity, limit, num_cores=sm.num_cores,
+                    enforce_optimal_placement=enforce_optimal_placement,
+                    allow_spilling=allow_spilling,
+                    perfect_factorization=perfect_factorization,
+                    partial_sums=partial_sums, sparse_domains=sparse_domains,
+                    redundant_bounds=redundant_bounds, tight_bounds=tight_bounds,
+                    num_workers=num_workers))
+            else:
+                hints.append(_tile_einsum(e, sm.capacity, limit, perfect_factorization,
+                                          partial_sums, num_workers))
+        if None not in hints:
+            _add_unfused_hints(sm, hints)
         if time_limit is not None:
             time_limit = max(time_limit - (time.perf_counter() - t0), 1e-3)
 
