@@ -740,6 +740,18 @@ def _build_factor_constraints(sm: SchedulerModel, partial_sums: bool = False) ->
                     model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[a][o])
                     model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[o][a])
 
+    # Private on-chip buffers: no parallel loops on strict descendants of a written buffer.
+    # Each core would fill only its slice of the buffer, so an on-chip (fused)
+    # consumer would need other cores' slices, which requires inter-core communication.
+    # Read-only buffers above a parallel loop are fine: each core loads its own copy.
+    for x in sm.must_write:
+        for a in ops:
+            if a == x:
+                continue
+            strictly_below = [sm.ancestor[x][a], sm.ancestor[a][x].Not()]
+            for dim in sm.op_allowed_temp_dims[a]:
+                model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(strictly_below)
+
 def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
                      partial_sums: bool = False, tight_bounds: bool = False) -> None:
     """
