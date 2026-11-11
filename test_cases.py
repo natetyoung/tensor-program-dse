@@ -934,6 +934,114 @@ def gdn_full_decode_einsums(hidden=1024, d_k=128, d_v=128, k_heads=16, v_heads=1
     ]
     return einsums
 
+# Test Case 15: GDN core decode with its gate and gated RMSNorm output,
+# batched (its __main__ uses Qwen3.5-35B-A3B's linear-attention sizes at
+# batch 128): the part of Test Case 12 that gdn_nki_kernel.py's
+# deltanet_tkg_batched_bh computes (with its folded RMSNormGated tail), over
+# all (request, head) items. Inputs are q, k, v, the log-decay g_log
+# (-exp_alog * softplus(a_inter + dt_bias), so only the exp is done here),
+# b (beta), S_{t-1}, z (pre-silu) and norm_weight; outputs are S_t and
+# o_gated. Every tensor but norm_weight has a 'batch' dim; as in the KDA
+# batched variants, the per-sequence state contractions have no reuse across
+# the batch, so 'batch' has granularity 1 there. The kernel decays the state
+# before multiplying by k, which is algebraically the same as delta's
+# g * kv_mem here (S_t = g S_{t-1} + k (b (v - g S_{t-1}^T k))^T).
+def gdn_core_gated_decode_einsums(batch=128, d_k=128, d_v=128, k_heads=16, v_heads=16):
+    rep = v_heads // k_heads
+    hd, hs = head_dims(k_heads, rep)
+    bhd = ('batch',) + hd
+    bs = {'batch': batch, **hs}
+    return [
+        Einsum(
+            operand_dims={
+                'g_log': bhd,
+                'g': bhd
+            },
+            output_operand='g',
+            dim_sizes=bs,
+            accel_gran={'PRODUCT': 128},
+            compute_cost=22,
+            operation='exp'
+        ),
+        Einsum(
+            operand_dims={
+                'S_{t-1}': ('batch', 'd_k0', 'd_v') + hd,
+                'k': ('batch', 'd_k0', 'h'),
+                'kv_mem': ('batch', 'd_v') + hd
+            },
+            output_operand='kv_mem',
+            dim_sizes={'d_k0': d_k, 'd_v': d_v, **bs},
+            accel_gran={'d_k0': 128, 'd_v': 128, **{d: 1 for d in bhd}},
+            compute_cost=4481,
+            operation='matvec'
+        ),
+        Einsum(
+            operand_dims={
+                'v': ('batch', 'd_v') + hd,
+                'kv_mem': ('batch', 'd_v') + hd,
+                'g': bhd,
+                'b': bhd,
+                'delta': ('batch', 'd_v') + hd
+            },
+            output_operand='delta',
+            dim_sizes={'d_v': d_v, **bs},
+            accel_gran={'PRODUCT': 128},
+            compute_cost=3 * 22,
+            operation='b * (v - g * kv_mem)'
+        ),
+        Einsum(
+            operand_dims={
+                'S_{t-1}': ('batch', 'd_k0', 'd_v') + hd,
+                'g': bhd,
+                'k': ('batch', 'd_k0', 'h'),
+                'delta': ('batch', 'd_v') + hd,
+                'S_t': ('batch', 'd_k0', 'd_v') + hd
+            },
+            output_operand='S_t',
+            dim_sizes={'d_k0': d_k, 'd_v': d_v, **bs},
+            accel_gran={'PRODUCT': 128},
+            compute_cost=3 * 22,
+            operation='g * S_{t-1} + k delta^T'
+        ),
+        Einsum(
+            operand_dims={
+                'S_t': ('batch', 'd_k1', 'd_v') + hd,
+                'q': ('batch', 'd_k1', 'h'),
+                'o': ('batch', 'd_v') + hd
+            },
+            output_operand='o',
+            dim_sizes={'d_k1': d_k, 'd_v': d_v, **bs},
+            accel_gran={'d_k1': 128, 'd_v': 128, **{d: 1 for d in bhd}},
+            compute_cost=4481,
+            operation='matvec'
+        ),
+        Einsum(
+            operand_dims={
+                'o': ('batch', 'd_v') + hd,
+                'computed_o_rmsnorm': bhd
+            },
+            output_operand='computed_o_rmsnorm',
+            dim_sizes={'d_v': d_v, **bs},
+            accel_gran={'PRODUCT': 128},
+            compute_cost=22,
+            operation='rmsnorm'
+        ),
+        Einsum(
+            operand_dims={
+                'o': ('batch', 'd_v') + hd,
+                'computed_o_rmsnorm': bhd,
+                'norm_weight': ('d_v',),
+                'z': ('batch', 'd_v') + hd,
+                'o_gated': ('batch', 'd_v') + hd
+            },
+            output_operand='o_gated',
+            dim_sizes={'d_v': d_v, **bs},
+            accel_gran={'PRODUCT': 128},
+            compute_cost=22,
+            operation='o / computed_o_rmsnorm * norm_weight * silu(z)'
+        )
+    ]
+
 # Batched variants of Test Cases 8 and 9.  Activations, short-conv history and
 # recurrent state gain a 'batch' dim; weights are shared across the batch.
 # Weight projections (matvecs at batch 1) become matmuls with the batch on the
@@ -1479,6 +1587,7 @@ if __name__ == '__main__':
     #     tight_bounds=True,
     #     codesign_costs=((149 * 1024 * 1024 * 1024) // (700 * 1000 * 1000), int(332.25 * 4), int(2.59 * 400), int(432.2 * 1000 * 1000 * 4) // 100)
     # )
+    # scheduler(llama_ffn_einsums(2048, 7168, 3072, num_exp=1), capacity=3 * 1024 * 1024, num_cores=1, allow_spilling=True, perfect_factorization=True, partial_sums=True, sparse_domains=True)
 
 
     print("=========================================")
@@ -1516,6 +1625,16 @@ if __name__ == '__main__':
     #     sparse_domains=True,
     #     tight_bounds=True,
     #     global_outputs=('S_t', 'k_lin_out', 'q_lin_out', 'v_lin_out', 'out')
+    # )
+    # print("=========================================")
+    # print("Running Test Case 15: GDN Core Decode with Gated RMSNorm (batched)")
+    # print("=========================================")
+    # scheduler(
+    #     gdn_core_gated_decode_einsums(batch=128, d_k=128, d_v=128, k_heads=16, v_heads=32),
+    #     capacity=3 * 1024 * 1024,
+    #     num_cores=1,
+    #     allow_spilling=True,
+    #     global_outputs=('S_t',)
     # )
     # print("=========================================")
     # print("Running Test Case 10: KDA Full Decode (batched)")
