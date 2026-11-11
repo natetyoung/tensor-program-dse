@@ -1248,7 +1248,18 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
     for op in ops:
         min_communication_cost += sm.total_cost_vars[op].proto.domain[0]
         max_communication_cost += sm.total_cost_vars[op].proto.domain[1]
-    
+
+    # The worst-case costs (e.g. a full accelerator step per element) can
+    # make the objective 5 * final_cost + compute + comm possibly overflow,
+    # which CP-SAT rejects (it requires every linear expression's worst case
+    # to stay within int64 max / 2).  Cap the costs so that it cannot; this
+    # only excludes schedules costing more than ~5.8e17.
+    cost_limit = (2**63 - 1) // 16
+    if max(min_compute_cost, min_communication_cost) > cost_limit:
+        raise ValueError(f"Minimum possible cost exceeds the representable limit {cost_limit}")
+    max_compute_cost = min(max_compute_cost, cost_limit)
+    max_communication_cost = min(max_communication_cost, cost_limit)
+
     sm.final_compute_cost = model.NewIntVar(min_compute_cost, max_compute_cost, 'final_compute_cost')
     model.Add(sm.final_compute_cost == sum(sm.all_compute_iters[i] * sm.einsums[i].compute_cost
                                         for i in range(len(sm.einsums))))
@@ -1797,6 +1808,11 @@ def scheduler(
         _build_optimality_constraints(sm)
     _build_capacity_constraint(sm)   # uses spatial_cost from _build_cost_vars
     _build_compute_cost_and_objective(sm)
+    # An invalid model (e.g. int64 overflow) makes Solve return MODEL_INVALID
+    # and solver.Value() return garbage, so fail loudly instead.
+    invalid = sm.model.Validate()
+    if invalid:
+        raise ValueError(f"CP-SAT model is invalid: {invalid}")
     if hint:
         t0 = time.perf_counter()
         tilings = []
