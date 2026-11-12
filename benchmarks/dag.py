@@ -2,8 +2,8 @@
 case's capacity, configured to match FFM on snowcat.
 
 Usage:
-    python dag.py [--time-limit S] [--threads N] [--no-hint] [--force] CASE ...
-    python dag.py --cap-at-ffm [--threads N] [--no-hint] [--force] CASE ...
+    python dag.py [--time-limit S] [--threads N] [--no-hint] [--hint-bound] [--force] CASE ...
+    python dag.py --cap-at-ffm [--threads N] [--no-hint] [--hint-bound] [--force] CASE ...
 The first writes results/<case>/dag.{json,txt} with a fixed time limit
 (default 600 s); the second writes results/<case>/dag_capped.{json,txt} with
 the time limit set to FFM's time on the case (needs results/<case>/ffm.json,
@@ -114,17 +114,22 @@ def extract(sm, solver):
 @contextlib.contextmanager
 def deadline_solve(deadline, trace, timing):
     '''Make the scheduler's CP-SAT solve stop at the deadline (counting the
-    model build) and record improving solutions. The hint's single-einsum
-    tilings (also CP-SAT solves, with their own limits) are left alone.'''
-    orig_solve, orig_tile = cp_model.CpSolver.Solve, gds._tile_einsum
+    model build) and record improving solutions. The CP-SAT solves that
+    build the hint (each einsum's tiling, and with hint_bound the hint's
+    completion) have their own limits and are left alone.'''
+    helpers = ('_tile_einsum', '_solve_einsum_alone', '_complete_hint')
+    orig_solve = cp_model.CpSolver.Solve
+    orig = {h: getattr(gds, h) for h in helpers}
     tiling = []
 
-    def tile(*args):
-        tiling.append(True)
-        try:
-            return orig_tile(*args)
-        finally:
-            tiling.pop()
+    def inner(f):
+        def wrapped(*args, **kwargs):
+            tiling.append(True)
+            try:
+                return f(*args, **kwargs)
+            finally:
+                tiling.pop()
+        return wrapped
 
     def solve(solver, model, cb=None):
         if tiling:
@@ -134,15 +139,19 @@ def deadline_solve(deadline, trace, timing):
         solver.parameters.max_time_in_seconds = max(deadline - time.perf_counter(), 1e-3)
         return orig_solve(solver, model, trace)
 
-    cp_model.CpSolver.Solve, gds._tile_einsum = solve, tile
+    cp_model.CpSolver.Solve = solve
+    for h, f in orig.items():
+        setattr(gds, h, inner(f))
     try:
         yield
     finally:
-        cp_model.CpSolver.Solve, gds._tile_einsum = orig_solve, orig_tile
+        cp_model.CpSolver.Solve = orig_solve
+        for h, f in orig.items():
+            setattr(gds, h, f)
 
 
 def run(name, time_limit, threads, hint, capped, num_cores=1, stem=None, compare_ffm=True,
-        workload=None):
+        workload=None, hint_bound=False):
     '''One run; writes results/<name>/<stem>.{json,txt} (stem: dag or
     dag_capped by default). num_cores: the scheduler's cores (parallel
     hardware units), not CP-SAT's threads. workload: optional dict(einsums
@@ -168,13 +177,13 @@ def run(name, time_limit, threads, hint, capped, num_cores=1, stem=None, compare
             warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always')
         sm, solver = scheduler(einsums, workload['capacity'], time_limit=time_limit, hint=hint,
-                               num_workers=threads,
+                               hint_bound=hint_bound, num_workers=threads,
                                global_outputs=workload.get('global_outputs', ()), **settings)
     wall = time.perf_counter() - t0
     status = solver.StatusName(solver.response_proto.status)
     r = {'case': name, 'tool': 'dag', 'capped_at_ffm': capped, 'status': status,
          'wall_s': wall, 'build_s': timing.get('build_s'), 'time_limit_s': time_limit,
-         'hint': hint, 'hint_given': len(sm.model.proto.solution_hint.vars) > 0,
+         'hint': hint, 'hint_bound': hint_bound, 'hint_given': len(sm.model.proto.solution_hint.vars) > 0,
          'capacity': workload['capacity'], 'bits_per_value': workload.get('bits_per_value'),
          'ffm_traffic': ffm and ffm['traffic'],
          'export_warnings': workload.get('export_warnings', []),
@@ -217,6 +226,8 @@ if __name__ == '__main__':
                    help='CP-SAT workers (default: all available cores)')
     p.add_argument('--no-hint', action='store_true',
                    help='do not hint CP-SAT with single-einsum tilings')
+    p.add_argument('--hint-bound', action='store_true',
+                   help='never return a schedule worse than the hint (scheduler(hint_bound=True))')
     p.add_argument('--force', action='store_true', help='rerun even if the result exists')
     p.add_argument('cases', nargs='+', choices=CASES, metavar='CASE')
     args = p.parse_args()
@@ -235,4 +246,5 @@ if __name__ == '__main__':
                 print(f"{name} ({stem}): warning: FFM ran with {ffm['machine']['threads']} "
                       f'processes, CP-SAT gets {args.threads} workers')
             limit = ffm['wall_s']
-        run(name, limit, args.threads, not args.no_hint, args.cap_at_ffm)
+        run(name, limit, args.threads, not args.no_hint, args.cap_at_ffm,
+            hint_bound=args.hint_bound)

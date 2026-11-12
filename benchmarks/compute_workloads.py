@@ -37,7 +37,7 @@ WORKLOADS = {
         capacity=3 * 1024 * 1024),
     # test_cases.py's Test Case 13 at Llama-3-8B's shapes.
     'gqa_llama3_8b': lambda: dict(
-        einsums=gqa_attention_prefill_einsums(kv=8, g=4, s=1024, d=128),
+        einsums=gqa_attention_prefill_einsums(kv=8, g=4, s=2048, d=128),
         capacity=3 * 1024 * 1024),
     # test_cases.py's Test Case 14: Kimi K3's gated MLA block.
     'kimi_k3_mla': lambda: dict(einsums=kimi_k3_mla_einsums(s=1024), capacity=3 * 1024 * 1024),

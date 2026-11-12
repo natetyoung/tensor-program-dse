@@ -362,70 +362,57 @@ def attention_decode_einsums(b=1, s=256, s1=1, h=128, d=512):
 
 # Test Case 8: KDA core decode
 def kda_core_decode_einsums(d_k=128, d_v=128, heads=96):
-    # S_t = (I - β_t k_t k_t^T) Diag(α_t) S_{t-1} + β_t k_t v_t^T
-    # = 
+    # S_t = (I - β_t k_t k_t^T) Diag(α_t) S_{t-1} + β_t k_t v_t^T, in
+    # delta-rule form (as fla's fused_recurrent_kda computes it at decode):
+    # with S' = Diag(α) S_{t-1}, (I - β k k^T) S' = S' - β k (k^T S'), so
+    #   kv_mem = S'^T k = S_{t-1}^T (α ⊙ k)
+    #   delta  = β (v - kv_mem)
+    #   S_t    = Diag(α) S_{t-1} + k delta^T
+    # and the d_k x d_k matrix (I - β k k^T) Diag(α) is never formed. As in
+    # GDN (Test Case 11), the decay is folded into the state read and update
+    # rather than materializing S'; α is a vector over d_k here, so it scales
+    # k in the read instead of being a scalar.
     # K3 numbers are as given: d_k=128, d_v=128, heads=96
     return [
         Einsum(
             operand_dims={
+                'S_{t-1}': ('d_k0', 'd_v', 'h'),
+                'a': ('d_k0', 'h'),
                 'k': ('d_k0', 'h'),
-                'b': ('h',),
-                'bk': ('d_k0', 'h')
+                'kv_mem': ('d_v', 'h')
             },
-            output_operand='bk',
-            dim_sizes={'h': heads, 'd_k0': d_k},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='elew_mul'
-        ),
-        Einsum(
-            operand_dims={
-                'bk': ('d_k0', 'h'),
-                'k': ('d_k1', 'h'),
-                'a': ('d_k1', 'h'),
-                '1bkka': ('d_k0', 'd_k1', 'h')
-            },
-            output_operand='1bkka',
-            dim_sizes={'h': heads, 'd_k0': d_k, 'd_k1': d_k},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=4 * 22,
-            operation='(I - b k k^T) Diag(a)'
-        ),
-        Einsum(
-            operand_dims={
-                '1bkka': ('d_k0', 'd_k1', 'h'),
-                'S_{t-1}': ('d_k1', 'd_v', 'h'),
-                '1bkkas': ('d_k0', 'd_v', 'h')
-            },
-            output_operand='1bkkas',
-            dim_sizes={'h': heads, 'd_k0': d_k, 'd_k1': d_k, 'd_v': d_v},
-            accel_gran={'d_k0': 128, 'd_k1': 128, 'd_v': 512, 'h': 1},
-            compute_cost=70710,
-            operation='matmul'
-        ),
-        Einsum(
-            operand_dims={
-                'bk': ('d_k0', 'h'),
-                'v': ('d_v', 'h'),
-                'bkv': ('d_k0', 'd_v', 'h')
-            },
-            output_operand='bkv',
+            output_operand='kv_mem',
             dim_sizes={'h': heads, 'd_k0': d_k, 'd_v': d_v},
+            accel_gran={'d_k0': 128, 'd_v': 128, 'h': 1},
+            compute_cost=4481,
+            operation='matvec((a * k), S_{t-1})'
+        ),
+        Einsum(
+            operand_dims={
+                'v': ('d_v', 'h'),
+                'kv_mem': ('d_v', 'h'),
+                'b': ('h',),
+                'delta': ('d_v', 'h')
+            },
+            output_operand='delta',
+            dim_sizes={'h': heads, 'd_v': d_v},
             accel_gran={'PRODUCT': 128},
             compute_cost=2 * 22,
-            operation='elew_mul'
+            operation='b * (v - kv_mem)'
         ),
         Einsum(
             operand_dims={
-                '1bkkas': ('d_k0', 'd_v', 'h'),
-                'bkv': ('d_k0', 'd_v', 'h'),
+                'S_{t-1}': ('d_k0', 'd_v', 'h'),
+                'a': ('d_k0', 'h'),
+                'k': ('d_k0', 'h'),
+                'delta': ('d_v', 'h'),
                 'S_t': ('d_k0', 'd_v', 'h')
             },
             output_operand='S_t',
             dim_sizes={'h': heads, 'd_k0': d_k, 'd_v': d_v},
             accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='elew_add'
+            compute_cost=3 * 22,
+            operation='a * S_{t-1} + k delta^T'
         )
     ]
 
@@ -520,7 +507,7 @@ def kda_full_decode_einsums(hidden=7168, d_k=128, d_v=128, heads=96, a_rank=128)
     # bypass: linear_dn->linear_up->sigmoid
     # output=linear(norm(KDA_core(qk, v, a, b)) * bypass)
     einsums = []
-    einsums += lcan_einsums('q', hidden=hidden, d_out=d_k, d_out_name='d_k1', heads=heads, norm=True)
+    einsums += lcan_einsums('q', hidden=hidden, d_out=d_k, d_out_name='d_k0', heads=heads, norm=True)
     einsums += lcan_einsums('k', hidden=hidden, d_out=d_k, d_out_name='d_k0', heads=heads, norm=True)
     einsums += lcan_einsums('v', hidden=hidden, d_out=d_v, d_out_name='d_v', heads=heads, norm=False)
     einsums += [ # a and b
@@ -539,24 +526,24 @@ def kda_full_decode_einsums(hidden=7168, d_k=128, d_v=128, heads=96, a_rank=128)
         Einsum(
             operand_dims={
                 'a_down': ('a_rank',),
-                'W_a_up': ('a_rank', 'd_k1', 'h'),
-                'a_inter': ('d_k1', 'h')
+                'W_a_up': ('a_rank', 'd_k0', 'h'),
+                'a_inter': ('d_k0', 'h')
             },
             output_operand='a_inter',
-            dim_sizes={'a_rank': a_rank, 'h': heads, 'd_k1': d_k},
-            accel_gran={'a_rank': 128, ('d_k1', 'h'): 128},
+            dim_sizes={'a_rank': a_rank, 'h': heads, 'd_k0': d_k},
+            accel_gran={'a_rank': 128, ('d_k0', 'h'): 128},
             compute_cost=4481,
             operation='matvec'
         ),
         Einsum(
             operand_dims={
-                'a_inter': ('d_k1', 'h'),
+                'a_inter': ('d_k0', 'h'),
                 'exp_alog': ('h',),
-                'dt_bias': ('d_k1', 'h'),
-                'a': ('d_k1', 'h')
+                'dt_bias': ('d_k0', 'h'),
+                'a': ('d_k0', 'h')
             },
             output_operand='a',
-            dim_sizes={'d_k1': d_k, 'h': heads},
+            dim_sizes={'d_k0': d_k, 'h': heads},
             accel_gran={'PRODUCT': 128},
             compute_cost=110,
             operation='exp(-5*sigmoid(exp_alog*(a_inter+dt_bias)))'
@@ -589,13 +576,13 @@ def kda_full_decode_einsums(hidden=7168, d_k=128, d_v=128, heads=96, a_rank=128)
     einsums += [ # S_{t-1}q -> RMSNorm
         Einsum(
             operand_dims={
-                'S_t': ('d_k1', 'd_v', 'h'),
-                'q': ('d_k1', 'h'),
+                'S_t': ('d_k0', 'd_v', 'h'),
+                'q': ('d_k0', 'h'),
                 'o': ('d_v', 'h')
             },
             output_operand='o',
-            dim_sizes={'d_k1': d_k, 'd_v': d_v, 'h': heads},
-            accel_gran={'d_k1': 128, 'd_v': 128, 'h': 1},
+            dim_sizes={'d_k0': d_k, 'd_v': d_v, 'h': heads},
+            accel_gran={'d_k0': 128, 'd_v': 128, 'h': 1},
             compute_cost=4481,
             operation='matvec'
         ),
@@ -811,7 +798,7 @@ def gdn_full_decode_einsums(hidden=1024, d_k=128, d_v=128, k_heads=16, v_heads=1
     rep = v_heads // k_heads
     hd, hs = head_dims(k_heads, rep)
     einsums = []
-    einsums += gdn_lcan_einsums('q', hidden=hidden, d_out=d_k, d_out_name='d_k1', heads=k_heads, norm=True, hist=conv_kernel - 1)
+    einsums += gdn_lcan_einsums('q', hidden=hidden, d_out=d_k, d_out_name='d_k0', heads=k_heads, norm=True, hist=conv_kernel - 1)
     einsums += gdn_lcan_einsums('k', hidden=hidden, d_out=d_k, d_out_name='d_k0', heads=k_heads, norm=True, hist=conv_kernel - 1)
     einsums += gdn_lcan_einsums('v', hidden=hidden, d_out=d_v, d_out_name='d_v', heads=k_heads, norm=False, rep=rep, hist=conv_kernel - 1)
     einsums += [ # g and b
@@ -868,13 +855,13 @@ def gdn_full_decode_einsums(hidden=1024, d_k=128, d_v=128, k_heads=16, v_heads=1
     einsums += [ # S_t q -> RMSNorm
         Einsum(
             operand_dims={
-                'S_t': ('d_k1', 'd_v') + hd,
-                'q': ('d_k1', 'h'),
+                'S_t': ('d_k0', 'd_v') + hd,
+                'q': ('d_k0', 'h'),
                 'o': ('d_v',) + hd
             },
             output_operand='o',
-            dim_sizes={'d_k1': d_k, 'd_v': d_v, **hs},
-            accel_gran={'d_k1': 128, 'd_v': 128, **{d: 1 for d in hd}},
+            dim_sizes={'d_k0': d_k, 'd_v': d_v, **hs},
+            accel_gran={'d_k0': 128, 'd_v': 128, **{d: 1 for d in hd}},
             compute_cost=4481,
             operation='matvec'
         ),
@@ -1005,13 +992,13 @@ def gdn_core_gated_decode_einsums(batch=128, d_k=128, d_v=128, k_heads=16, v_hea
         ),
         Einsum(
             operand_dims={
-                'S_t': ('batch', 'd_k1', 'd_v') + hd,
-                'q': ('batch', 'd_k1', 'h'),
+                'S_t': ('batch', 'd_k0', 'd_v') + hd,
+                'q': ('batch', 'd_k0', 'h'),
                 'o': ('batch', 'd_v') + hd
             },
             output_operand='o',
-            dim_sizes={'d_k1': d_k, 'd_v': d_v, **bs},
-            accel_gran={'d_k1': 128, 'd_v': 128, **{d: 1 for d in bhd}},
+            dim_sizes={'d_k0': d_k, 'd_v': d_v, **bs},
+            accel_gran={'d_k0': 128, 'd_v': 128, **{d: 1 for d in bhd}},
             compute_cost=4481,
             operation='matvec'
         ),
@@ -1048,67 +1035,47 @@ def gdn_core_gated_decode_einsums(batch=128, d_k=128, d_v=128, k_heads=16, v_hea
 # 128-wide accelerator axis, as in llama_ffn_einsums.  Per-sequence state
 # contractions have no reuse across the batch, so 'batch' has granularity 1.
 def kda_core_batched_decode_einsums(batch=32, d_k=128, d_v=128, heads=96):
+    # Test Case 8's delta-rule form, batched.
     return [
         Einsum(
             operand_dims={
+                'S_{t-1}': ('batch', 'd_k0', 'd_v', 'h'),
+                'a': ('batch', 'd_k0', 'h'),
                 'k': ('batch', 'd_k0', 'h'),
-                'b': ('batch', 'h'),
-                'bk': ('batch', 'd_k0', 'h')
+                'kv_mem': ('batch', 'd_v', 'h')
             },
-            output_operand='bk',
-            dim_sizes={'batch': batch, 'h': heads, 'd_k0': d_k},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='elew_mul'
-        ),
-        Einsum(
-            operand_dims={
-                'bk': ('batch', 'd_k0', 'h'),
-                'k': ('batch', 'd_k1', 'h'),
-                'a': ('batch', 'd_k1', 'h'),
-                '1bkka': ('batch', 'd_k0', 'd_k1', 'h')
-            },
-            output_operand='1bkka',
-            dim_sizes={'batch': batch, 'h': heads, 'd_k0': d_k, 'd_k1': d_k},
-            accel_gran={'PRODUCT': 128},
-            compute_cost=4 * 22,
-            operation='(I - b k k^T) Diag(a)'
-        ),
-        Einsum(
-            operand_dims={
-                '1bkka': ('batch', 'd_k0', 'd_k1', 'h'),
-                'S_{t-1}': ('batch', 'd_k1', 'd_v', 'h'),
-                '1bkkas': ('batch', 'd_k0', 'd_v', 'h')
-            },
-            output_operand='1bkkas',
-            dim_sizes={'batch': batch, 'h': heads, 'd_k0': d_k, 'd_k1': d_k, 'd_v': d_v},
-            accel_gran={'d_k0': 128, 'd_k1': 128, 'd_v': 512, 'h': 1, 'batch': 1},
-            compute_cost=70710,
-            operation='matmul'
-        ),
-        Einsum(
-            operand_dims={
-                'bk': ('batch', 'd_k0', 'h'),
-                'v': ('batch', 'd_v', 'h'),
-                'bkv': ('batch', 'd_k0', 'd_v', 'h')
-            },
-            output_operand='bkv',
+            output_operand='kv_mem',
             dim_sizes={'batch': batch, 'h': heads, 'd_k0': d_k, 'd_v': d_v},
+            accel_gran={'d_k0': 128, 'd_v': 128, 'h': 1, 'batch': 1},
+            compute_cost=4481,
+            operation='matvec((a * k), S_{t-1})'
+        ),
+        Einsum(
+            operand_dims={
+                'v': ('batch', 'd_v', 'h'),
+                'kv_mem': ('batch', 'd_v', 'h'),
+                'b': ('batch', 'h'),
+                'delta': ('batch', 'd_v', 'h')
+            },
+            output_operand='delta',
+            dim_sizes={'batch': batch, 'h': heads, 'd_v': d_v},
             accel_gran={'PRODUCT': 128},
             compute_cost=2 * 22,
-            operation='elew_mul'
+            operation='b * (v - kv_mem)'
         ),
         Einsum(
             operand_dims={
-                '1bkkas': ('batch', 'd_k0', 'd_v', 'h'),
-                'bkv': ('batch', 'd_k0', 'd_v', 'h'),
+                'S_{t-1}': ('batch', 'd_k0', 'd_v', 'h'),
+                'a': ('batch', 'd_k0', 'h'),
+                'k': ('batch', 'd_k0', 'h'),
+                'delta': ('batch', 'd_v', 'h'),
                 'S_t': ('batch', 'd_k0', 'd_v', 'h')
             },
             output_operand='S_t',
             dim_sizes={'batch': batch, 'h': heads, 'd_k0': d_k, 'd_v': d_v},
             accel_gran={'PRODUCT': 128},
-            compute_cost=22,
-            operation='elew_add'
+            compute_cost=3 * 22,
+            operation='a * S_{t-1} + k delta^T'
         )
     ]
 
@@ -1196,7 +1163,7 @@ def lcan_batched_einsums(name, batch=32, hidden=7168, d_out=128, d_out_name='d_k
 # Test Case 10: KDA Full Decode, batched
 def kda_full_batched_decode_einsums(batch=32, hidden=7168, d_k=128, d_v=128, heads=96, a_rank=128):
     einsums = []
-    einsums += lcan_batched_einsums('q', batch=batch, hidden=hidden, d_out=d_k, d_out_name='d_k1', heads=heads, norm=True)
+    einsums += lcan_batched_einsums('q', batch=batch, hidden=hidden, d_out=d_k, d_out_name='d_k0', heads=heads, norm=True)
     einsums += lcan_batched_einsums('k', batch=batch, hidden=hidden, d_out=d_k, d_out_name='d_k0', heads=heads, norm=True)
     einsums += lcan_batched_einsums('v', batch=batch, hidden=hidden, d_out=d_v, d_out_name='d_v', heads=heads, norm=False)
     einsums += [ # a and b
@@ -1215,24 +1182,24 @@ def kda_full_batched_decode_einsums(batch=32, hidden=7168, d_k=128, d_v=128, hea
         Einsum(
             operand_dims={
                 'a_down': ('batch', 'a_rank'),
-                'W_a_up': ('a_rank', 'd_k1', 'h'),
-                'a_inter': ('batch', 'd_k1', 'h')
+                'W_a_up': ('a_rank', 'd_k0', 'h'),
+                'a_inter': ('batch', 'd_k0', 'h')
             },
             output_operand='a_inter',
-            dim_sizes={'batch': batch, 'a_rank': a_rank, 'h': heads, 'd_k1': d_k},
-            accel_gran={'batch': 128, 'a_rank': 128, ('d_k1', 'h'): 512},
+            dim_sizes={'batch': batch, 'a_rank': a_rank, 'h': heads, 'd_k0': d_k},
+            accel_gran={'batch': 128, 'a_rank': 128, ('d_k0', 'h'): 512},
             compute_cost=70710,
             operation='matmul'
         ),
         Einsum(
             operand_dims={
-                'a_inter': ('batch', 'd_k1', 'h'),
+                'a_inter': ('batch', 'd_k0', 'h'),
                 'exp_alog': ('h',),
-                'dt_bias': ('d_k1', 'h'),
-                'a': ('batch', 'd_k1', 'h')
+                'dt_bias': ('d_k0', 'h'),
+                'a': ('batch', 'd_k0', 'h')
             },
             output_operand='a',
-            dim_sizes={'batch': batch, 'd_k1': d_k, 'h': heads},
+            dim_sizes={'batch': batch, 'd_k0': d_k, 'h': heads},
             accel_gran={'PRODUCT': 128},
             compute_cost=110,
             operation='exp(-5*sigmoid(exp_alog*(a_inter+dt_bias)))'
@@ -1265,13 +1232,13 @@ def kda_full_batched_decode_einsums(batch=32, hidden=7168, d_k=128, d_v=128, hea
     einsums += [ # S_{t-1}q -> RMSNorm
         Einsum(
             operand_dims={
-                'S_t': ('batch', 'd_k1', 'd_v', 'h'),
-                'q': ('batch', 'd_k1', 'h'),
+                'S_t': ('batch', 'd_k0', 'd_v', 'h'),
+                'q': ('batch', 'd_k0', 'h'),
                 'o': ('batch', 'd_v', 'h')
             },
             output_operand='o',
-            dim_sizes={'batch': batch, 'd_k1': d_k, 'd_v': d_v, 'h': heads},
-            accel_gran={'d_k1': 128, 'd_v': 128, 'h': 1, 'batch': 1},
+            dim_sizes={'batch': batch, 'd_k0': d_k, 'd_v': d_v, 'h': heads},
+            accel_gran={'d_k0': 128, 'd_v': 128, 'h': 1, 'batch': 1},
             compute_cost=4481,
             operation='matvec'
         ),
@@ -1658,6 +1625,6 @@ if __name__ == '__main__':
     # print("=========================================")
     # print("Running Test Case 13: GQA Attention Prefill (Llama-3-8B)")
     # print("=========================================")
-    # scheduler(gqa_attention_prefill_einsums(), capacity=3 * 1024 * 1024, num_cores=1, allow_spilling=True)
+    # scheduler(gqa_attention_prefill_einsums(s=2048), capacity=3 * 1024 * 1024, num_cores=1, allow_spilling=True)
 
     # scheduler(attn_prefill(32, 4096, 128), num_cores=1, capacity=3 * 1024 * 1024, allow_spilling=True, perfect_factorization=True, partial_sums=True, sparse_domains=True)

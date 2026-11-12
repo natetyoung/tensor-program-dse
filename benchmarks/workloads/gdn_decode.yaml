@@ -5,19 +5,18 @@
 # (exp, silu, norms) are written as products of their operands, which moves
 # the same data; the norm's sum is a reduction.
 #
-# Rank variables (ranks are the upper-case names): bt = batch, dk0 / dk1 =
-# d_k0 / d_k1, dv = d_v, h = key head, r = value head within its key head
+# Rank variables (ranks are the upper-case names): bt = batch, dk0 =
+# d_k0, dv = d_v, h = key head, r = value head within its key head
 # (only when V_HEADS > K_HEADS; value-head tensors then carry h and r).
 # Tensors renamed from test_cases.py: S_{t-1} -> S_prev.
-# As there, k is read over d_k0, and S_t (produced over d_k0) is read over
-# d_k1 by o. Every tensor but norm_weight has the batch rank.
+# As there, q, k and the rows of S are all on d_k0, the one key axis.
+# Every tensor but norm_weight has the batch rank.
 # Set BATCH, D_K, D_V, K_HEADS, V_HEADS.
 {% set VH = 'bt, h, r' if V_HEADS > K_HEADS else 'bt, h' %}
 workload:
   rank_sizes:
     BT: {{BATCH}}
     DK0: {{D_K}}
-    DK1: {{D_K}}
     DV: {{D_V}}
     H: {{K_HEADS}}
 {% if V_HEADS > K_HEADS %}
@@ -32,6 +31,6 @@ workload:
   - "delta[dv, {{VH}}] = v[dv, {{VH}}] * kv_mem[dv, {{VH}}] * g[{{VH}}] * b[{{VH}}]"
   - "S_t[dk0, dv, {{VH}}] = S_prev[dk0, dv, {{VH}}] * g[{{VH}}] * k[bt, dk0, h] * delta[dv, {{VH}}]"
   # S_t q -> gated RMSNorm
-  - "o[dv, {{VH}}] = S_t[DK0: dk1, dv, {{VH}}] * q[bt, dk1, h]"
+  - "o[dv, {{VH}}] = S_t[dk0, dv, {{VH}}] * q[bt, dk0, h]"
   - "computed_o_rmsnorm[{{VH}}] = o[dv, {{VH}}]"
   - "o_gated[dv, {{VH}}] = o[dv, {{VH}}] * computed_o_rmsnorm[{{VH}}] * norm_weight[dv] * z[dv, {{VH}}]"

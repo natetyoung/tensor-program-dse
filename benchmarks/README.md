@@ -57,6 +57,7 @@ Each tool can also be run on its own. `summarize.py` rebuilds the summary from w
 | `--steps ffm,dag` | Run only some steps. |
 | `--force` | Rerun steps whose results already exist. By default they are skipped, so an interrupted run can be resumed. |
 | `--no-hint` | Don't hint CP-SAT with single-einsum tilings (see below). |
+| `--hint-bound` | Never return a schedule worse than the hint (`scheduler(hint_bound=True)`; see below). Off by default. |
 | `--measure-memory` | Record each step's peak memory (see [Measuring memory](#measuring-memory)). |
 
 ### Different machines
@@ -100,6 +101,7 @@ With `--measure-memory`, `run.py` and `einsum_run.py` run each tool step in its 
 - **Shared tiles:** both can share one on-chip tile of an input between consumers.
 - **Hints:** by default, `scheduler(hint=True)` first tiles each einsum on its own with `cb_einsum_ml_cpsat97` and gives CP-SAT the resulting unfused schedule as a starting solution.
   - That tiling counts against the DAG scheduler's time.
+  - CP-SAT treats a hint as a suggestion only, so a time-limited search can end worse than the hint. With `--hint-bound` (`scheduler(hint_bound=True)`), the hint is first completed into a full feasible solution by a solve with its variables fixed, and the objective is constrained to at most that solution's. That solve also counts against the time.
 - **DAG time limits** cover everything: building the model, the hint tilings and the search.
   - CP-SAT may overrun the limit slightly. `traffic_at_limit` is the best traffic found within it, and the summary reports that.
 - **Units:** traffic is in elements read plus written off-chip (FFM's bits ÷ `bits_per_value`).
@@ -118,7 +120,7 @@ With `--measure-memory`, `run.py` and `einsum_run.py` run each tool step in its 
   - `swiglu` is `test_cases.llama_ffn_einsums`. The merged variant isn't used: with compute costs, its model overflows CP-SAT's 64-bit objective, as `compute_workloads.py` explains.
 - **Objective:** with compute costs, it is 5 × max(compute, traffic) + compute + traffic. Both traffic and compute are per core.
 - **Output:** `results/<case>/compute_cores<N>.{json,txt}`, separate from the comparison's `dag*.json`, and `results/compute_cores_report.md`, which has a table of all runs followed by each schedule's loop nest.
-- **Options:** `--time-limit`, `--cores`, `--threads`, `--no-hint`, `--force`, and case names.
+- **Options:** `--time-limit`, `--cores`, `--threads`, `--no-hint`, `--hint-bound`, `--force`, and case names.
 
 ## Single einsums: cb_einsum_ml vs. TCM
 `python einsum_run.py` maps single einsums on AccelForge's `tpu_v4i` arch with TCM (FFM at O3) and with `cb_einsum_ml_cpsat97`, and writes `results/einsum_summary.md`.

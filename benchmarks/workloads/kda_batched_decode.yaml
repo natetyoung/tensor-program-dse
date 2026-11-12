@@ -4,13 +4,15 @@
 # products of their operands, which moves the same data.
 #
 # Rank variables (ranks are the upper-case names): b = batch, hd = hidden,
-# dk0 / dk1 = d_k0 / d_k1, dv = d_v, h = heads, hist = conv history,
+# dk0 = d_k0, dv = d_v, h = heads, hist = conv history,
 # ar = a_rank, oh = out_hidden.
 # Tensors renamed from test_cases.py, so that no tensor shares a name with a
 # rank variable or rank: hidden -> X, q -> qn, k -> kn, v -> vn, a -> A_gate,
-# b -> B_gate, S_{t-1} -> S_prev, 1bkka -> M_bkka, 1bkkas -> M_bkkas, o -> O.
-# As there, kn (produced over d_k0) is read over d_k1 by M_bkka, and S_t
-# (produced over d_k0) is read over d_k1 by O.
+# b -> B_gate, S_{t-1} -> S_prev, o -> O.
+# The KDA core is in delta-rule form, as there: kv_mem = S_prev^T (A_gate * kn),
+# delta = B_gate (vn - kv_mem), S_t = A_gate S_prev + kn delta^T.
+# As there, every key-dim tensor (q, k, A_gate, the rows of S) is on d_k0,
+# the one key axis of the head.
 # Set BATCH, HIDDEN, D_K, D_V, HEADS, A_RANK.
 {% macro lcan(name, dk, norm) %}
   - "{{name}}_lin_out[b, {{dk}}, h] = X[b, hd] * {{name}}_lin_w[hd, {{dk}}, h]"
@@ -29,7 +31,6 @@ workload:
     B: {{BATCH}}
     HD: {{HIDDEN}}
     DK0: {{D_K}}
-    DK1: {{D_K}}
     DV: {{D_V}}
     H: {{HEADS}}
     HIST: 3
@@ -38,23 +39,21 @@ workload:
   bits_per_value: {All: 8}
   einsums:
   # q, k, v: linear, short conv, silu, (l2 norm)
-{{ lcan("q", "dk1", True) }}
+{{ lcan("q", "dk0", True) }}
 {{ lcan("k", "dk0", True) }}
 {{ lcan("v", "dv", False) }}
   # a and b
   - "a_down[b, ar] = X[b, hd] * W_a_down[hd, ar]"
-  - "a_inter[b, dk1, h] = a_down[b, ar] * W_a_up[ar, dk1, h]"
-  - "A_gate[b, dk1, h] = a_inter[b, dk1, h] * exp_alog[h] * dt_bias[dk1, h]"
+  - "a_inter[b, dk0, h] = a_down[b, ar] * W_a_up[ar, dk0, h]"
+  - "A_gate[b, dk0, h] = a_inter[b, dk0, h] * exp_alog[h] * dt_bias[dk0, h]"
   - "b_inter[b, h] = X[b, hd] * W_b_down[hd, h]"
   - "B_gate[b, h] = b_inter[b, h]"
   # KDA core
-  - "bk[b, dk0, h] = kn[b, dk0, h] * B_gate[b, h]"
-  - "M_bkka[b, dk0, dk1, h] = bk[b, dk0, h] * kn[b, DK0: dk1, h] * A_gate[b, dk1, h]"
-  - "M_bkkas[b, dk0, dv, h] = M_bkka[b, dk0, dk1, h] * S_prev[b, dk1, dv, h]"
-  - "bkv[b, dk0, dv, h] = bk[b, dk0, h] * vn[b, dv, h]"
-  - "S_t[b, dk0, dv, h] = M_bkkas[b, dk0, dv, h] * bkv[b, dk0, dv, h]"
+  - "kv_mem[b, dv, h] = S_prev[b, dk0, dv, h] * A_gate[b, dk0, h] * kn[b, dk0, h]"
+  - "delta[b, dv, h] = vn[b, dv, h] * kv_mem[b, dv, h] * B_gate[b, h]"
+  - "S_t[b, dk0, dv, h] = S_prev[b, dk0, dv, h] * A_gate[b, dk0, h] * kn[b, dk0, h] * delta[b, dv, h]"
   # S_t q -> RMSNorm
-  - "O[b, dv, h] = S_t[b, DK0: dk1, dv, h] * qn[b, dk1, h]"
+  - "O[b, dv, h] = S_t[b, dk0, dv, h] * qn[b, dk0, h]"
   - "computed_o_rmsnorm[b, h] = O[b, dv, h]"
   # bypass
   - "g_inter[b, dv, h] = X[b, hd] * W_g[hd, dv, h]"

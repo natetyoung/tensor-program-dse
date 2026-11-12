@@ -107,9 +107,9 @@ CASES = {
     # Grouped-query attention prefill with softmax (workloads/
     # gqa_attention_prefill.yaml, Test Case 13 of test_cases.py) at
     # Llama-3-8B's shapes: 32 query heads in 8 KV groups of 4, head dim 128,
-    # 1024 tokens. S and P (32 Mi elements each) dwarf Q, K, V and O.
+    # 2048 tokens. S and P (32 Mi elements each) dwarf Q, K, V and O.
     'gqa_llama3_8b': dict(workload='workloads/gqa_attention_prefill.yaml',
-                          jinja={'KV': 8, 'G': 4, 'S': 1024, 'D': 128},
+                          jinja={'KV': 8, 'G': 4, 'S': 2048, 'D': 128},
                           einsums=None, capacity=3 * 1024 * 1024),
     # Kimi K3's gated multi-latent attention block (workloads/kimi_k3_mla.yaml,
     # Test Case 14 of test_cases.py), prefill of 1024 tokens: 18 einsums,

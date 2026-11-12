@@ -4,7 +4,7 @@ across cores), each with the same time limit, and report the schedules. No
 FFM comparison.
 
 Usage:
-    python cores.py [--time-limit S] [--cores 1,8] [--threads N] [--no-hint]
+    python cores.py [--time-limit S] [--cores 1,8] [--threads N] [--no-hint] [--hint-bound]
                     [--force] [CASE ...]
 Default cases: swiglu, kda_batched, gdn_decode, siso_k128, gqa_llama3_8b,
 kimi_k3_mla; default limit 1800 s per run (up to 6 hours for all twelve runs).
@@ -100,6 +100,8 @@ def main():
                    help='CP-SAT workers (default: all available cores)')
     p.add_argument('--no-hint', action='store_true',
                    help='do not hint CP-SAT with single-einsum tilings')
+    p.add_argument('--hint-bound', action='store_true',
+                   help='never return a schedule worse than the hint (scheduler(hint_bound=True))')
     p.add_argument('--force', action='store_true', help='rerun runs whose results exist')
     args = p.parse_args()
     cases = args.cases or DEFAULT_CASES
@@ -113,7 +115,8 @@ def main():
                 print(f'{case} ({stem(n)}): already done, skipping (--force to rerun)')
                 continue
             dag.run(case, args.time_limit, args.threads, not args.no_hint, False,
-                    num_cores=n, stem=stem(n), compare_ffm=False, workload=WORKLOADS[case]())
+                    num_cores=n, stem=stem(n), compare_ffm=False, workload=WORKLOADS[case](),
+                    hint_bound=args.hint_bound)
     print('\n'.join(report(cases, cores)))
     print(f'Written to {REPORT}')
 
