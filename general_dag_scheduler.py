@@ -240,6 +240,8 @@ class SchedulerModel:
     final_communication_cost: Optional[cp_model.IntVar] = None
     chosen_capacity: Optional[cp_model.IntVar] = None
     compute_area: Optional[cp_model.IntVar] = None
+    # objective: the linear expression the model minimises
+    objective: Optional[cp_model.LinearExpr] = None
 
 
 # ─── 3. Model-building helpers ────────────────────────────────────────────────
@@ -1293,7 +1295,8 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
             final_cost >= sm.final_communication_cost
         )
 
-        model.Minimize(final_cost*5 + sm.final_compute_cost + sm.final_communication_cost)
+        sm.objective = final_cost*5 + sm.final_compute_cost + sm.final_communication_cost
+        model.Minimize(sm.objective)
 
     else:
         # minimize max(accesses, compute*bandwidth*mac_area/(area-capacity*sram_area))
@@ -1323,7 +1326,8 @@ def _build_compute_cost_and_objective(sm: SchedulerModel) -> None:
         model.Add(final_cost >= sm.final_compute_cost * sm.codesign_costs[0])
         model.Add(final_cost >= sm.final_communication_cost)
 
-        model.Minimize(final_cost)
+        sm.objective = final_cost
+        model.Minimize(sm.objective)
 
 
 def _tile_einsum(e: Einsum, capacity: int, time_limit: Optional[float],
@@ -1432,6 +1436,51 @@ def _add_unfused_hints(sm: SchedulerModel, hints) -> None:
     for i in sm.fused:
         for v in sm.fused[i].values():
             model.AddHint(v, 0)
+
+
+def _complete_hint(sm: SchedulerModel, time_limit: Optional[float],
+                   num_workers: Optional[int]):
+    """
+    Solve a copy of sm.model with every hinted variable fixed to its hint,
+    so CP-SAT only fills in the variables the hint leaves out (timeline,
+    costs, ...).  Returns (values, objective): one value per variable of
+    sm.model, in proto order, and the objective of that completion; or None
+    if none was found within time_limit (or the hint is infeasible).
+    """
+    hint = sm.model.proto.solution_hint
+    m = sm.model.clone()
+    m.ClearHints()
+    for v, val in zip(hint.vars, hint.values):
+        m.Add(m.get_int_var_from_proto_index(v) == val)
+    solver = cp_model.CpSolver()
+    if time_limit is not None:
+        solver.parameters.max_time_in_seconds = time_limit
+    if num_workers is not None:
+        solver.parameters.num_workers = num_workers
+    status = solver.Solve(m)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None
+    return list(solver.response_proto.solution), round(solver.ObjectiveValue())
+
+
+def _bound_by_hint(sm: SchedulerModel, time_limit: Optional[float],
+                   num_workers: Optional[int]) -> Optional[int]:
+    """
+    Replace sm.model's hint by its complete, feasible version (see
+    _complete_hint) and require the objective to be no worse than that
+    hint's, so the solve cannot return a schedule worse than the unfused
+    one it was hinted with.  Returns the bound, or None (and leaves the
+    model unchanged) if the hint could not be completed.
+    """
+    done = _complete_hint(sm, time_limit, num_workers)
+    if done is None:
+        return None
+    values, bound = done
+    sm.model.ClearHints()
+    for i, val in enumerate(values):
+        sm.model.AddHint(sm.model.get_int_var_from_proto_index(i), val)
+    sm.model.Add(sm.objective <= bound)
+    return bound
 
 
 # ─── 4. Result extraction and printing ───────────────────────────────────────
@@ -1721,7 +1770,8 @@ def scheduler(
     linearization_level: Optional[int] = None,
     global_outputs: Iterable[str] = (),
     codesign_costs: Optional[Tuple[int]] = None,
-    hint: bool = False
+    hint: bool = False,
+    hint_bound: bool = False
 ) -> Tuple['SchedulerModel', cp_model.CpSolver]:
     """
     Synthesize a schedule-tree / loop-tree structure for a DAG of einsums.
@@ -1792,6 +1842,17 @@ def scheduler(
                                tenth of time_limit (shared over the einsums),
                                and its time counts against time_limit.  No
                                hint is given if some einsum is not tiled.
+    hint_bound               : With hint, also make the hint binding: solve
+                               the model with the hinted variables fixed to
+                               complete the hint into a full feasible
+                               solution, hint that, and constrain the
+                               objective to at most its value.  CP-SAT
+                               treats a hint only as a suggestion and can
+                               otherwise end a time-limited search worse
+                               than the hint; with this it cannot.  The
+                               completion's time counts against time_limit.
+                               Warns and goes on without the bound if no
+                               hint was given or it could not be completed.
 
     Returns
     ───────
@@ -1887,8 +1948,22 @@ def scheduler(
                                           partial_sums, num_workers))
         if None not in hints:
             _add_unfused_hints(sm, hints)
+            if hint_bound:
+                left = None if time_limit is None else max(
+                    time_limit - (time.perf_counter() - t0), 1e-3)
+                bound = _bound_by_hint(sm, left, num_workers)
+                if bound is None:
+                    warnings.warn('hint_bound: the hint could not be completed into a '
+                                  'feasible solution; solving without the bound')
+                elif debug:
+                    print(f"HINT BOUND: objective <= {bound}")
+        elif hint_bound:
+            warnings.warn('hint_bound: some einsum was not tiled, so no hint was given; '
+                          'solving without the bound')
         if time_limit is not None:
             time_limit = max(time_limit - (time.perf_counter() - t0), 1e-3)
+    elif hint_bound:
+        warnings.warn('hint_bound has no effect without hint')
 
     if debug:
         print("MODEL WRITING DONE")
