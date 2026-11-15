@@ -151,13 +151,15 @@ def deadline_solve(deadline, trace, timing):
 
 
 def run(name, time_limit, threads, hint, capped, num_cores=1, stem=None, compare_ffm=True,
-        workload=None, hint_bound=False):
+        workload=None, hint_bound=False, seed=None, overrides=None):
     '''One run; writes results/<name>/<stem>.{json,txt} (stem: dag or
     dag_capped by default). num_cores: the scheduler's cores (parallel
     hardware units), not CP-SAT's threads. workload: optional dict(einsums
     (Einsum objects), capacity, global_outputs) to schedule instead of
-    results/<name>/einsums.json with compute_cost = 0.'''
-    settings = dict(SETTINGS, num_cores=num_cores)
+    results/<name>/einsums.json with compute_cost = 0. seed: CP-SAT's
+    random seed. overrides: scheduler() settings replacing SETTINGS' (e.g.
+    optimality_constraints for ablation.py).'''
+    settings = dict(SETTINGS, num_cores=num_cores, **(overrides or {}))
     stem = stem or ('dag_capped' if capped else 'dag')
     ffm = load(result_path(name, 'ffm.json')) if compare_ffm else None
     if workload is None:
@@ -177,18 +179,24 @@ def run(name, time_limit, threads, hint, capped, num_cores=1, stem=None, compare
             warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always')
         sm, solver = scheduler(einsums, workload['capacity'], time_limit=time_limit, hint=hint,
-                               hint_bound=hint_bound, num_workers=threads,
+                               hint_bound=hint_bound, num_workers=threads, seed=seed,
                                global_outputs=workload.get('global_outputs', ()), **settings)
     wall = time.perf_counter() - t0
     status = solver.StatusName(solver.response_proto.status)
     r = {'case': name, 'tool': 'dag', 'capped_at_ffm': capped, 'status': status,
          'wall_s': wall, 'build_s': timing.get('build_s'), 'time_limit_s': time_limit,
-         'hint': hint, 'hint_bound': hint_bound, 'hint_given': len(sm.model.proto.solution_hint.vars) > 0,
+         'seed': seed, 'hint': hint, 'hint_bound': hint_bound, 'hint_given': len(sm.model.proto.solution_hint.vars) > 0,
          'capacity': workload['capacity'], 'bits_per_value': workload.get('bits_per_value'),
          'ffm_traffic': ffm and ffm['traffic'],
          'export_warnings': workload.get('export_warnings', []),
          'compute_costs': [e.compute_cost for e in einsums],
-         'warnings': [str(w.message) for w in caught], 'settings': settings,
+         'warnings': [str(w.message) for w in caught],
+         'settings': {k: list(v) if isinstance(v, (tuple, set)) else v
+                      for k, v in settings.items()},
+         'model_size': {'variables': len(sm.model.proto.variables),
+                        'constraints': len(sm.model.proto.constraints)},
+         'search': {'conflicts': solver.NumConflicts(), 'branches': solver.NumBranches(),
+                    'deterministic_time': solver.response_proto.deterministic_time},
          'machine': machine_info(threads)}
     if status in ('OPTIMAL', 'FEASIBLE'):
         r.update(extract(sm, solver))

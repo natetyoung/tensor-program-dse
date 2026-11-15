@@ -1002,21 +1002,41 @@ def _build_redundant_bounds(sm: SchedulerModel) -> None:
         model.Add(sm.total_cost_vars[op] >= -(-op_size // sm.num_cores)).OnlyEnforceIf(moved)
 
 
-def _build_optimality_constraints(sm: SchedulerModel) -> None:
+# Names of the constraint families _build_optimality_constraints can add, for
+# scheduler(optimality_constraints=...) (e.g. to ablate them one at a time).
+OPTIMALITY_CONSTRAINTS = (
+    'unused_temporal',   # temporal factor 1 for dims no operand at the node uses
+    'spatial_gran',      # spatial factor <= max useful accelerator granularity
+    'same_operand',      # no strict ancestry between copies of one tensor
+    'unfused_separate',  # with no fusion at all, einsums share no ancestry
+    'no_empty_branch',   # a non-root anchor needs some factor > 1
+)
+
+
+def _build_optimality_constraints(sm: SchedulerModel,
+                                  enabled: Iterable[str] = OPTIMALITY_CONSTRAINTS) -> None:
     """
     Add optional pruning / optimality constraints that eliminate symmetry and
     obviously suboptimal solutions without changing the feasible set of truly
-    optimal schedules.
+    optimal schedules.  `enabled` picks which of these families (named as in
+    OPTIMALITY_CONSTRAINTS) to add:
 
-    - Temporal factors for dimensions that do not appear in the current node's
-      operand (and no same-node operand) are forced to 1.
-    - Spatial factors for a dimension are bounded by the maximum accelerator
-      granularity for that dimension across all einsums.
-    - Different occurrences of the same original operand must not be strict 
-      ancestors of each other.
-    - Operands belonging to different einsums must not be in an ancestor
-      relationship unless the einsums are connected by a path of fusions.
+    - unused_temporal: temporal factors for dimensions that do not appear in
+      the current node's operand (and no same-node operand) are forced to 1.
+    - spatial_gran: spatial factors for a dimension are bounded by the maximum
+      accelerator granularity for that dimension across all einsums.
+    - same_operand: different occurrences of the same original operand must
+      not be strict ancestors of each other.
+    - unfused_separate: operands belonging to different einsums must not be in
+      an ancestor relationship when nothing is fused.
+    - no_empty_branch: an anchor node with a strict ancestor must have some
+      temporal or parallel factor > 1.
     """
+    enabled = set(enabled)
+    unknown = enabled - set(OPTIMALITY_CONSTRAINTS)
+    if unknown:
+        raise ValueError(f'unknown optimality constraints {sorted(unknown)}; '
+                         f'choose from {OPTIMALITY_CONSTRAINTS}')
     model = sm.model
     ops = sm.all_operands
 
@@ -1036,7 +1056,7 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
         for dim in sm.op_allowed_temp_dims[op]:
             # Temporal factor is 1 if dim does not appear in this operand or
             # any same-node operand (always better to move to inner loop).
-            if dim not in sm.all_operand_dims[op]:
+            if 'unused_temporal' in enabled and dim not in sm.all_operand_dims[op]:
                 same_node_users = [
                     other for other in ops
                     if dim in sm.all_operand_dims[other] and other != op
@@ -1045,7 +1065,7 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
                     *([sm.same_node[op][other].Not() for other in same_node_users]))
             # Spatial factor is at most the max useful granularity when all
             # descendants use this dimension.
-            if dim in sm.all_operand_dims[op]:
+            if 'spatial_gran' in enabled and dim in sm.all_operand_dims[op]:
                 non_users = [
                     other for other in ops
                     if dim not in sm.all_operand_dims[other] and other != op
@@ -1055,7 +1075,7 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
 
     # No strict ancestorship between different occurrences of the
     # same original operand.
-    for e in sm.einsums:
+    for e in sm.einsums if 'same_operand' in enabled else ():
         for op in e.operand_dims:
             other_names = [op2 for op2 in ops
                         if sm.original_names[op2] == sm.original_names[op] and op2 != op]
@@ -1065,7 +1085,7 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
 
     # When there is no fusion at all, operands from different einsums must not be
     # in any ancestor relationship.
-    for i in range(len(sm.einsums)):
+    for i in range(len(sm.einsums) if 'unfused_separate' in enabled else 0):
         for j in range(i + 1, len(sm.einsums)):
             e1, e2 = sm.einsums[i], sm.einsums[j]
             no_fusion_conds = [
@@ -1080,7 +1100,7 @@ def _build_optimality_constraints(sm: SchedulerModel) -> None:
                     ).OnlyEnforceIf(*no_fusion_conds)
 
     # No unnecessary branches: anchor nodes must have a factor > 1 if they have any ancestors
-    for op in ops:
+    for op in ops if 'no_empty_branch' in enabled else ():
         sum_of_dims = sum(
             [sm.temporal_dim[op][dim] for dim in sm.op_allowed_temp_dims[op]] +
             [sm.parallel_dim[op][dim] for dim in sm.op_allowed_temp_dims[op]]
@@ -1759,6 +1779,7 @@ def scheduler(
     enforce_optimal_placement: bool = True,
     allow_spilling: bool = False,
     debug: bool = True,
+    optimality_constraints: Optional[Iterable[str]] = None,
     perfect_factorization: bool = False,
     partial_sums: bool = False,
     sparse_domains: bool = False,
@@ -1786,6 +1807,9 @@ def scheduler(
     capacity                 : On-chip memory capacity (element count).
     enforce_optimal_placement: If True, add pruning constraints that eliminate
                                obviously suboptimal solutions.
+    optimality_constraints   : With enforce_optimal_placement, which of
+                               those constraint families to add (names in
+                               OPTIMALITY_CONSTRAINTS); None adds them all.
     allow_spilling           : If True, allow intermediate operands to be
                                written to and read from off-chip memory.
     debug                    : If True, print model-building progress.
@@ -1914,8 +1938,10 @@ def scheduler(
     _build_cost_vars(sm, perfect_factorization, partial_sums, tight_bounds)  # must come after both factor and fusion phases
     if redundant_bounds:
         _build_redundant_bounds(sm)  # uses total_*_dim and total_cost_vars from _build_cost_vars
+    if optimality_constraints is None:
+        optimality_constraints = OPTIMALITY_CONSTRAINTS
     if enforce_optimal_placement:
-        _build_optimality_constraints(sm)
+        _build_optimality_constraints(sm, optimality_constraints)
     _build_capacity_constraint(sm)   # uses spatial_cost from _build_cost_vars
     _build_compute_cost_and_objective(sm)
     # An invalid model (e.g. int64 overflow) makes Solve return MODEL_INVALID
@@ -1938,6 +1964,7 @@ def scheduler(
                 hints.append(_solve_einsum_alone(
                     e, sm.capacity, limit, num_cores=sm.num_cores,
                     enforce_optimal_placement=enforce_optimal_placement,
+                    optimality_constraints=optimality_constraints,
                     allow_spilling=allow_spilling,
                     perfect_factorization=perfect_factorization,
                     partial_sums=partial_sums, sparse_domains=sparse_domains,

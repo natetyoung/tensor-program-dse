@@ -122,6 +122,37 @@ With `--measure-memory`, `run.py` and `einsum_run.py` run each tool step in its 
 - **Output:** `results/<case>/compute_cores<N>.{json,txt}`, separate from the comparison's `dag*.json`, and `results/compute_cores_report.md`, which has a table of all runs followed by each schedule's loop nest.
 - **Options:** `--time-limit`, `--cores`, `--threads`, `--no-hint`, `--hint-bound`, `--force`, and case names.
 
+## Ablation of the optimality constraints
+`python ablation.py` measures how much each of the five constraint families that `_build_optimality_constraints` adds (`enforce_optimal_placement`) helps CP-SAT. It runs the DAG scheduler alone, with no FFM, on the comparison's cases and with `dag.py`'s settings.
+- **Families** (`general_dag_scheduler.OPTIMALITY_CONSTRAINTS`; select them with `scheduler(optimality_constraints=...)`):
+  - `unused_temporal`: a temporal factor is 1 for a dim that no operand at the node uses.
+  - `spatial_gran`: a spatial factor is at most the max useful accelerator granularity, which is 1 here, as compute costs are 0.
+  - `same_operand`: no strict ancestry between copies of one tensor.
+  - `unfused_separate`: with nothing fused, einsums share no ancestry.
+  - `no_empty_branch`: an anchor with an ancestor needs some factor > 1.
+- **Configurations** (`--configs`):
+  - `all`: the default scheduler;
+  - `none`: no family;
+  - `no-X`: leave one family out;
+  - `only-X`: one family alone.
+  - The default is `all`, `none` and the five `no-X`; `--configs every` adds the five `only-X`.
+- **Seeds:** each configuration runs with CP-SAT seeds 0..N-1 (`--seeds`, default 3), since multi-worker search is nondeterministic. For each case, every configuration runs with one seed before any moves to the next.
+- **Isolation:** each run is its own process, so a crash or memory blow-up stops only that run.
+- **Output:** `results/<case>/ablation/<config>_s<seed>.{json,txt}`, and `results/ablation_summary.md`.
+  - The summary gives, per configuration, the shifted geometric mean of solve times and its ratio to `all`; a timeout counts as the time limit.
+  - Per case, it gives the median traffic, the best proven bound, CP-SAT's conflicts and deterministic time, and the model size.
+- **Solution quality over time:** besides time to prove optimality, the summary measures how good a schedule each configuration has found by a given time. This needs no extra runs, as each run records every improving solution.
+  - **Reference:** each case's least traffic found by any of its ablation runs, and whether it was proved optimal.
+  - **`gap @ t`:** median over seeds of the percent by which the best traffic found within t seconds exceeds the reference. t counts model building and hint tiling. Set the checkpoints with `--checkpoints` (default `10,60,300`).
+  - **`t to X%`:** median time to first get within X% of the reference (`--target`, default 1). A run that never got there counts as its time limit.
+  - **Overview:** per configuration and checkpoint, the cases within the target and the geometric mean of traffic over the reference.
+  - **Rewriting the summary:** both are computed when the summary is written, so `python ablation.py --summarize --checkpoints 5,30,120 --target 0.5` rewrites it for other choices.
+  - **Time limits:** past a run's time limit its traffic is unknown unless it proved optimality, so pick checkpoints within `--time-limit`. A shorter `--time-limit` then bounds the study's cost.
+- **Hints:** with hints (the default), the single-einsum hint is often already good, so quality at early checkpoints mostly reflects the hint. `--no-hint` measures the search alone. Its runs go to `results/<case>/ablation_nohint/` and its summary to `results/ablation_nohint_summary.md`, so the two never mix. Pass `--no-hint` with `--summarize` too.
+- **Soundness check:** the summary flags any configuration whose proven bound exceeds traffic another run found. That would mean its constraints cut off better schedules.
+- **Cost:** the default plan is 23 cases × 7 configurations × 3 seeds = 483 runs. `--dry-run` lists them, with a worst-case time. Most cases prove optimality in seconds with every family, but `none` may not.
+- **Options:** `--time-limit` (default 600), `--threads`, `--no-hint`, `--force`, `--measure-memory`, `--checkpoints`, `--target`, `--summarize` (only rewrite the summary), `--list`, and case names.
+
 ## Single einsums: cb_einsum_ml vs. TCM
 `python einsum_run.py` maps single einsums on AccelForge's `tpu_v4i` arch with TCM (FFM at O3) and with `cb_einsum_ml_cpsat97`, and writes `results/einsum_summary.md`.
 - **Einsums** (`einsum_cases.py`): GPT-3 6.7B's prefill einsums at batch 64 and 65,536 tokens (16 bits), the four einsums of one routed SwiGLU expert of DeepSeek-V4-Pro (`workloads/deepseek_v4_pro_expert.yaml`, 16 bits), and a tensor contraction `C` (`workloads/contraction.yaml`, 8 bits). `C` runs only when named, since TCM has not mapped it within 48 hours.
@@ -148,6 +179,7 @@ Options: `--list`, `--steps tcm,cpsat`, `--threads N` (both tools), `--time-limi
 | `summarize.py` | Writes `results/summary.md`. |
 | `run.py` | Runs everything. |
 | `cores.py`, `compute_workloads.py` | The core-count runs with compute costs; see above. |
+| `ablation.py` | The ablation of the optimality constraints; see above. |
 | `einsum_cases.py`, `einsum_tcm.py`, `einsum_cpsat.py`, `einsum_run.py` | The single-einsum comparison: cases, the two tools, and the runner and summary. |
 
 ## Adding cases and tests
