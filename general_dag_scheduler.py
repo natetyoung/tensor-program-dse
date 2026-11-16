@@ -31,7 +31,7 @@ import io
 import time
 import warnings
 from dataclasses import dataclass, field
-from math import isqrt, prod
+from math import gcd, isqrt, prod
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from ortools.sat.python import cp_model
@@ -1036,64 +1036,121 @@ def _build_redundant_bounds(sm: SchedulerModel) -> None:
 # scheduler(optimality_constraints=...) (e.g. to ablate them one at a time).
 OPTIMALITY_CONSTRAINTS = (
     'unused_temporal',   # temporal factor 1 for dims no operand at the node uses
-    'spatial_gran',      # spatial factor <= max useful accelerator granularity
+    'spatial_gran',      # no spatial factor that splits into a loop at no cost
     'disjoint_unfused_reads',  # two loads of one tensor are never live together
     'unfused_separate',  # with no fusion at all, einsums share no ancestry
     'no_empty_branch',   # a non-root anchor needs some factor > 1
 )
 
 
-def _build_spatial_gran(sm: SchedulerModel) -> None:
+def _gran_removable_tiles(size: int, singles: List[int], multis: List[int],
+                          perfect_factorization: bool) -> Tuple[Set[int], Set[int]]:
     """
-    The spatial_gran optimality constraint: an operand's spatial factor along
-    dim is at most the max useful accelerator granularity G[dim], when every
-    operand in its subtree (its node included) uses dim.
+    Tile sizes along one dim of this size that the spatial_gran constraint may
+    remove, as (at a node without strict descendants, at any node).  singles:
+    sizes of the dim's single-dim granularity groups over the compute
+    einsums; multis: sizes of its multi-dim and PRODUCT groups.  See
+    _build_spatial_gran.
+    """
+    def splittable(s: int) -> bool:
+        # Some k >= 2 dividing s splits the tile into k tiles of s / k
+        # with no more compute steps for any group.
+        for k in _divisors(s)[1:]:
+            t = s // k
+            if (all(k * -(-t // g) <= -(-s // g) for g in singles)
+                    and all(t % p == 0 for p in multis)):
+                return True
+        return False
 
-    Justification: such a tile can be split into a loop over dim at the
-    operand's node with smaller tiles, at no cost.  That holds only if
+    leaf = {s for s in range(2, size + 1) if splittable(s)}
+    L = 1
+    for g in singles + multis:
+        L = L * g // gcd(L, g)
+    if L == 1:
+        # No granularity at all: any tile splits into tiles of 1.
+        return leaf, set(range(2, size + 1))
+    anywhere: Set[int] = set()
+    if perfect_factorization:
+        # Ascending, so a divisor's own status is known when it is needed.
+        for s in _divisors(size):
+            if s > L and s % L == 0 and all(
+                    L % t == 0 or t in anywhere for t in _divisors(s) if t != s):
+                anywhere.add(s)
+    return leaf, anywhere
 
-    - the loop is legal there.  The one rule that can forbid it (every
-      operand below uses dim, so the per-operand allowed-dim and
-      reinterpreted-dim rules cannot) is that a reduction loop of an einsum
-      e may not enclose an operand of e together with an operand of a
-      consumer of e's output.  So the bound is off when the subtree holds
-      such a pair for a reduction dim of e that the consumer also has.
-    - the split costs nothing.  With G[dim] == 1 (no compute einsum has a
-      granularity on dim), splitting a tile of s into s tiles of 1 is exact
-      (1 divides everything, so also under perfect factorization), and
-      descendants only get smaller tiles with no more total loop count.
-      With G[dim] > 1, rounding matters: a tile of s splits into
-      k = ceil(s / G) exact tiles of s / k <= G, keeping both traffic and
-      compute steps, only if k divides s, only if every compute einsum with
-      a granularity on dim has it as a group of its own of size G (a
-      multi-dim or PRODUCT group, or a smaller G for another einsum, can
-      make the split cost more steps), and only if no strict descendant
-      has its own tiling of dim to adjust (its loop count need not divide
-      by k).  So for G > 1 the bound only removes those values of s, and
-      only at nodes without strict descendants; for dims in other groups
-      it is not applied at all.
+
+def _build_spatial_gran(sm: SchedulerModel, perfect_factorization: bool = False) -> None:
+    """
+    The spatial_gran optimality constraint: an operand's spatial factor
+    (tile) along dim takes no value that could be split into a loop over dim
+    at the operand's node with smaller tiles, at no cost, when every operand
+    in its subtree (its node included) uses dim.
+
+    That needs the loop to be legal there, and the split to cost nothing.
+
+    Legality.  Every operand below uses dim, so the per-operand allowed-dim
+    and reinterpreted-dim rules cannot forbid the loop.  The one rule that
+    can is that a reduction loop of an einsum e may not enclose an operand of
+    e together with an operand of a consumer of e's output.  So the
+    constraint is off when the subtree holds such a pair for a reduction dim
+    of e that the consumer also has.
+
+    Cost.  Splitting a tile of s into k tiles of t = s / k (k dividing s, so
+    the tiles are exact and traffic is unchanged, also under perfect
+    factorization) multiplies the loop count of the node by k.  The compute
+    steps of an einsum whose deepest operand is at the node are (the product
+    over its granularity groups of ceil(tile product / group size)) times
+    its loop count, so they do not grow if, over the compute einsums that
+    have dim,
+    - for each single-dim group (dim,) of size g (g = 1 for a dim with no
+      granularity entry):  k * ceil(t / g) <= ceil(s / g);
+    - for each multi-dim or PRODUCT group of size p holding dim:  p divides
+      t (then the group's tile product over p is an exact multiple of k,
+      whatever the other dims' tiles are).
+    A value s with such a k is removed at nodes without strict descendants
+    (_gran_removable_tiles' first set).
+
+    With strict descendants the split must also leave their tiles and loop
+    counts alone: each child's loop count along dim is divided by k.  That
+    works when the tile is split down to L, the least common multiple of
+    all the group sizes (k = s / L satisfies both conditions above), and
+    every descendant's tile divides L, so that its loops below the node
+    still multiply out.  So s is removed at any node (the second set) if
+    - no group has a size above 1 (L == 1: tiles of 1, with the
+      descendants' loops along dim dropped; any factorization), or
+    - under perfect factorization, s is a proper multiple of L and every
+      proper divisor of s (the only tiles a descendant can have) divides L
+      or is itself removed at any node (so by induction, deepest node
+      first, no descendant has it).
+    Without perfect factorization and with L > 1 a descendant's tile can be
+    any value, so only the first set is used.
+
+    With several cores a child may reach its tile through a parallel
+    factor.  The node then takes that factor (parallel loops are legal at
+    the node if they were at the child: every operand below has dim, and a
+    written buffer strictly above the node is live for the whole subtree or
+    none of it) and the other children trade their own parallel factors for
+    it.  This step is argued and fuzzed, not proven (a core count the
+    factor does not divide could lose parallelism).
     """
     model = sm.model
     ops = sm.all_operands
 
-    # Max useful accelerator granularity per dim; a single dim of a group
-    # could fill the whole axis by itself.
-    G: Dict[str, int] = {}
+    # Granularity group sizes per dim over the compute einsums that have it
+    singles: Dict[str, List[int]] = {d: [] for d in sm.all_dim_sizes}
+    multis: Dict[str, List[int]] = {d: [] for d in sm.all_dim_sizes}
     for e in sm.einsums:
-        for d in e.dim_sizes:
-            G.setdefault(d, 1)
-            if e.accel_gran and e.compute_cost > 0:
-                for dims, size in normalize_accel_gran(e):
-                    if d in dims or dims == ('PRODUCT',):
-                        G[d] = max(G[d], size)
-
-    # Dims with G > 1 for which the leaf-node bound is sound (see above)
-    leaf_ok: Dict[str, bool] = {}
-    for d, g in G.items():
-        leaf_ok[d] = g > 1 and all(
-            not (d in dims or dims == ('PRODUCT',)) or (dims == (d,) and size == g)
-            for e in sm.einsums if e.accel_gran and e.compute_cost > 0
-            for dims, size in normalize_accel_gran(e))
+        if not (e.accel_gran and e.compute_cost > 0):
+            continue
+        for dims, size in normalize_accel_gran(e):
+            for d in e.dim_sizes:
+                if dims == (d,):
+                    singles[d].append(size)
+                elif d in dims or dims == ('PRODUCT',):
+                    multis[d].append(size)
+    removable = {d: _gran_removable_tiles(n, sorted(set(singles[d])), sorted(set(multis[d])),
+                                          perfect_factorization)
+                 for d, n in sm.all_dim_sizes.items()}
 
     # (e, k) einsum pairs per dim d: d is a reduction dim of e that k, a
     # consumer of e's output, also has (as in the reduction-loop rule of
@@ -1110,7 +1167,7 @@ def _build_spatial_gran(sm: SchedulerModel) -> None:
                     reduction_pairs.setdefault(d, []).append((ei, ki))
 
     # Literals below may be true only if their condition holds, so setting
-    # them can only switch the bound off.
+    # them can only switch the constraint off.
     holds: Dict[Tuple[str, int], cp_model.IntVar] = {}
 
     def holds_einsum(op: str, ei: int) -> cp_model.IntVar:
@@ -1141,8 +1198,8 @@ def _build_spatial_gran(sm: SchedulerModel) -> None:
 
     for op in ops:
         for dim in sm.all_operand_dims[op]:
-            g = G[dim]
-            if g > 1 and not leaf_ok[dim]:
+            leaf, anywhere = removable[dim]
+            if not leaf and not anywhere:
                 continue
             conds = [sm.ancestor[op][other].Not() for other in ops
                      if other != op and dim not in sm.all_operand_dims[other]]
@@ -1158,19 +1215,19 @@ def _build_spatial_gran(sm: SchedulerModel) -> None:
                 model.AddBoolOr(pair_lits).OnlyEnforceIf(blocked)
                 conds.append(blocked.Not())
             var = sm.spatial_dim[op][dim]
-            if g == 1:
-                model.Add(var <= 1).OnlyEnforceIf(*conds)
-                continue
-            conds.append(has_strict_descendant(op).Not())
-            domain = list(var.proto.domain)  # (the proto field has no negative indexing)
-            allowed = [s for s in range(domain[0], domain[-1] + 1)
-                       if s <= g or s % -(-s // g) != 0]
-            model.AddLinearExpressionInDomain(
-                var, cp_model.Domain.FromValues(allowed)).OnlyEnforceIf(*conds)
+            values = range(1, sm.all_dim_sizes[dim] + 1)
+            if anywhere:
+                model.AddLinearExpressionInDomain(var, cp_model.Domain.FromValues(
+                    [s for s in values if s not in anywhere])).OnlyEnforceIf(*conds)
+            if leaf - anywhere:
+                model.AddLinearExpressionInDomain(var, cp_model.Domain.FromValues(
+                    [s for s in values if s not in leaf])).OnlyEnforceIf(
+                        *conds, has_strict_descendant(op).Not())
 
 
 def _build_optimality_constraints(sm: SchedulerModel,
-                                  enabled: Iterable[str] = OPTIMALITY_CONSTRAINTS) -> None:
+                                  enabled: Iterable[str] = OPTIMALITY_CONSTRAINTS,
+                                  perfect_factorization: bool = False) -> None:
     """
     Add optional pruning / optimality constraints that eliminate symmetry and
     obviously suboptimal solutions without changing the feasible set of truly
@@ -1179,9 +1236,11 @@ def _build_optimality_constraints(sm: SchedulerModel,
 
     - unused_temporal: temporal factors for dimensions that do not appear in
       the current node's operand (and no same-node operand) are forced to 1.
-    - spatial_gran: spatial factors for a dimension are bounded by the maximum
-      accelerator granularity for that dimension across all einsums, where
-      that is sound (see _build_spatial_gran).
+    - spatial_gran: a spatial factor for a dimension takes no value that
+      could be split into a loop with smaller tiles at no cost in traffic
+      or compute steps (given the accelerator granularities), where that is
+      sound (see _build_spatial_gran).  Needs perfect_factorization to know
+      which values that holds for at nodes with descendants.
     - disjoint_unfused_reads: two occurrences of the same original operand
       that are both loaded from memory (must_read) have disjoint live
       ranges, if they have the same dims.  Overlapping ranges imply the two
@@ -1214,7 +1273,7 @@ def _build_optimality_constraints(sm: SchedulerModel,
     ops = sm.all_operands
 
     if 'spatial_gran' in enabled:
-        _build_spatial_gran(sm)
+        _build_spatial_gran(sm, perfect_factorization)
 
     for op in ops:
         for dim in sm.op_allowed_temp_dims[op]:
@@ -2096,7 +2155,7 @@ def scheduler(
     if optimality_constraints is None:
         optimality_constraints = OPTIMALITY_CONSTRAINTS
     if enforce_optimal_placement:
-        _build_optimality_constraints(sm, optimality_constraints)
+        _build_optimality_constraints(sm, optimality_constraints, perfect_factorization)
     _build_capacity_constraint(sm)   # uses spatial_cost from _build_cost_vars
     _build_compute_cost_and_objective(sm)
     # An invalid model (e.g. int64 overflow) makes Solve return MODEL_INVALID
