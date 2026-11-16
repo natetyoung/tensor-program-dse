@@ -19,7 +19,8 @@ as FFM's wall_s includes its whole search. Each run also gets a final row
 run's rows extends to where the run stopped.
 
 Writes results/traces.csv (--out). With --plot PATH, also draws every trace
-(needs matplotlib).'''
+(needs matplotlib). With --from-csv CSV --plot PATH, draws the same plot from
+an existing CSV, without needing the results folder.'''
 import argparse, csv, sys
 
 from common import RESULTS, load
@@ -56,6 +57,20 @@ def case_rows(case, runs):
                          'traffic_rel': traffic / ffm['traffic'],
                          'status': r.get('status')})
     return rows, notes
+
+
+def read_rows(path):
+    '''Rows from a CSV written by this script, with numbers converted back.'''
+    with open(path, newline='') as f:
+        reader = csv.DictReader(f)
+        missing = set(COLUMNS) - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f'{path}: missing columns {sorted(missing)}')
+        rows = list(reader)
+    for r in rows:
+        for k in ('t_s', 'traffic', 'ffm_wall_s', 'ffm_traffic', 't_rel', 'traffic_rel'):
+            r[k] = float(r[k])
+    return rows
 
 
 def plot(rows, path):
@@ -102,10 +117,25 @@ def main():
     p.add_argument('--out', default=str(RESULTS / 'traces.csv'),
                    help='CSV to write (default: results/traces.csv)')
     p.add_argument('--plot', metavar='PATH', help='also plot the traces to PATH (e.g. .png)')
+    p.add_argument('--from-csv', metavar='CSV',
+                   help='plot from a CSV written earlier instead of reading results/; '
+                        'needs --plot; CASE and --runs then filter its rows')
     args = p.parse_args()
     runs = args.runs.split(',')
     if not set(runs) <= set(RUNS):
         p.error(f'--runs must be a subset of {list(RUNS)}')
+
+    if args.from_csv:
+        if not args.plot:
+            p.error('--from-csv needs --plot')
+        rows = [r for r in read_rows(args.from_csv)
+                if r['run'] in runs and (not args.cases or r['case'] in args.cases)]
+        if not rows:
+            p.error(f'no matching rows in {args.from_csv}')
+        plot(rows, args.plot)
+        print(f'{len(rows)} rows from {args.from_csv}; plot -> {args.plot}')
+        return
+
     cases = args.cases or sorted(d.name for d in RESULTS.iterdir()
                                  if (d / 'ffm.json').exists())
 
