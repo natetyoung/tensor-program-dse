@@ -127,7 +127,7 @@ With `--measure-memory`, `run.py` and `einsum_run.py` run each tool step in its 
 - **Families** (`general_dag_scheduler.OPTIMALITY_CONSTRAINTS`; select them with `scheduler(optimality_constraints=...)`):
   - `unused_temporal`: a temporal factor is 1 for a dim that no operand at the node uses.
   - `spatial_gran`: a spatial factor is at most the max useful accelerator granularity, which is 1 here, as compute costs are 0.
-  - `same_operand`: no strict ancestry between copies of one tensor.
+  - `disjoint_unfused_reads`: two loads of one tensor (with the same dims) are never live at the same step. It replaced `same_operand` (no strict ancestry between copies of one tensor), which was unsound; ablation results from before the change list `same_operand`.
   - `unfused_separate`: with nothing fused, einsums share no ancestry.
   - `no_empty_branch`: an anchor with an ancestor needs some factor > 1.
 - **Configurations** (`--configs`):

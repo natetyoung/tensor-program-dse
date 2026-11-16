@@ -12,7 +12,7 @@ The constraint families (general_dag_scheduler.OPTIMALITY_CONSTRAINTS):
     unused_temporal   temporal factor 1 for dims no operand at the node uses
     spatial_gran      spatial factor <= the max useful accelerator granularity
                       (1 here, as every case has compute_cost = 0)
-    same_operand      no strict ancestry between copies of one tensor
+    disjoint_unfused_reads  two loads of one tensor are never live together
     unfused_separate  with nothing fused, einsums share no ancestry
     no_empty_branch   a non-root anchor needs some factor > 1
 

@@ -534,7 +534,7 @@ def _build_fusion(sm: SchedulerModel, allow_spilling: bool,
 
     An operand need not be transferred to/from memory if it is fused with an
     adjacent occurrence of the same original operand.  Fusion requires the two
-    occurrences to be in the same node and to have effectively-identical time intervals.
+    occurrences to be in the same node and to have identical live step ranges.
     Fused operands must share spatial factors along shared dimensions.
 
     Producers of operands in global_outputs (original names) are always
@@ -732,27 +732,57 @@ def _build_factor_constraints(sm: SchedulerModel, partial_sums: bool = False) ->
                 if dim in sm.all_operand_dims[j]:
                     model.Add(sm.spatial_dim[i][dim] >= sm.spatial_dim[j][dim]).OnlyEnforceIf(sm.ancestor[i][j])
 
-    # No reduction across cores: Operands which are einsum outputs should have no ancestors (strict or otherwise) 
-    # with a parallel factor in any dimension which is not in all_operand_dims for that operand.
+    # The two rules below restrict parallel loops on strict descendants of an
+    # einsum output only while the output is live during the loop's subtree.
+    # A node can hold buffers live at different steps, so tree ancestry alone
+    # does not imply the output is live there: a subtree that finishes before
+    # the output is allocated, or starts after it is freed, is unaffected.
+    # out_disjoint[x][a]: x's live range lies entirely outside a's subtree
+    # window (half-reified: true only if so).
     einsum_outputs = [e.output_operand for e in sm.einsums]
+    out_disjoint: Dict[str, Dict[str, cp_model.IntVar]] = {}
+    for x in einsum_outputs:
+        out_disjoint[x] = {}
+        for a in ops:
+            if a == x:
+                continue
+            x_before = model.NewBoolVar(f'{x}_freed_before_win_{a}')
+            x_after = model.NewBoolVar(f'{x}_allocated_after_win_{a}')
+            model.Add(sm.time_end[x] < sm.win_start[a]).OnlyEnforceIf(x_before)
+            model.Add(sm.win_end[a] < sm.time_start[x]).OnlyEnforceIf(x_after)
+            disjoint = model.NewBoolVar(f'{x}_disjoint_win_{a}')
+            model.AddBoolOr([x_before, x_after]).OnlyEnforceIf(disjoint)
+            out_disjoint[x][a] = disjoint
+
+    # No reduction across cores: an einsum output may have no ancestor
+    # (strict or same-node) with a parallel factor in a dimension the output
+    # lacks, nor such a strict descendant while the output is live.
     for o in einsum_outputs:
         for a in ops:
             for dim in sm.op_allowed_temp_dims[a]:
                 if dim not in sm.all_operand_dims[o]:
                     model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[a][o])
-                    model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(sm.ancestor[o][a])
+                    if a != o:
+                        model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(
+                            sm.ancestor[o][a], sm.ancestor[a][o].Not(),
+                            out_disjoint[o][a].Not())
 
-    # Private on-chip buffers: no parallel loops on strict descendants of a written buffer.
-    # Each core would fill only its slice of the buffer, so an on-chip (fused)
-    # consumer would need other cores' slices, which requires inter-core communication.
-    # Read-only buffers above a parallel loop are fine: each core loads its own copy.
+    # Private on-chip buffers: no parallel loops on strict descendants of a
+    # written buffer while it is live.  Each core would fill only its slice of
+    # the buffer, so an on-chip (fused) consumer would need other cores'
+    # slices, which requires inter-core communication.  Read-only buffers
+    # above a parallel loop are fine: each core loads its own copy.
+    has_parallel = {}
+    for a in ops:
+        has_parallel[a] = model.NewBoolVar(f'{a}_has_parallel')
+        for dim in sm.op_allowed_temp_dims[a]:
+            model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(has_parallel[a].Not())
     for x in sm.must_write:
         for a in ops:
             if a == x:
                 continue
-            strictly_below = [sm.ancestor[x][a], sm.ancestor[a][x].Not()]
-            for dim in sm.op_allowed_temp_dims[a]:
-                model.Add(sm.parallel_dim[a][dim] == 1).OnlyEnforceIf(strictly_below)
+            model.AddBoolOr([has_parallel[a].Not(), out_disjoint[x][a]]).OnlyEnforceIf(
+                sm.ancestor[x][a], sm.ancestor[a][x].Not())
 
 def _build_cost_vars(sm: SchedulerModel, perfect_factorization: bool = False,
                      partial_sums: bool = False, tight_bounds: bool = False) -> None:
@@ -1007,10 +1037,136 @@ def _build_redundant_bounds(sm: SchedulerModel) -> None:
 OPTIMALITY_CONSTRAINTS = (
     'unused_temporal',   # temporal factor 1 for dims no operand at the node uses
     'spatial_gran',      # spatial factor <= max useful accelerator granularity
-    'same_operand',      # no strict ancestry between copies of one tensor
+    'disjoint_unfused_reads',  # two loads of one tensor are never live together
     'unfused_separate',  # with no fusion at all, einsums share no ancestry
     'no_empty_branch',   # a non-root anchor needs some factor > 1
 )
+
+
+def _build_spatial_gran(sm: SchedulerModel) -> None:
+    """
+    The spatial_gran optimality constraint: an operand's spatial factor along
+    dim is at most the max useful accelerator granularity G[dim], when every
+    operand in its subtree (its node included) uses dim.
+
+    Justification: such a tile can be split into a loop over dim at the
+    operand's node with smaller tiles, at no cost.  That holds only if
+
+    - the loop is legal there.  The one rule that can forbid it (every
+      operand below uses dim, so the per-operand allowed-dim and
+      reinterpreted-dim rules cannot) is that a reduction loop of an einsum
+      e may not enclose an operand of e together with an operand of a
+      consumer of e's output.  So the bound is off when the subtree holds
+      such a pair for a reduction dim of e that the consumer also has.
+    - the split costs nothing.  With G[dim] == 1 (no compute einsum has a
+      granularity on dim), splitting a tile of s into s tiles of 1 is exact
+      (1 divides everything, so also under perfect factorization), and
+      descendants only get smaller tiles with no more total loop count.
+      With G[dim] > 1, rounding matters: a tile of s splits into
+      k = ceil(s / G) exact tiles of s / k <= G, keeping both traffic and
+      compute steps, only if k divides s, only if every compute einsum with
+      a granularity on dim has it as a group of its own of size G (a
+      multi-dim or PRODUCT group, or a smaller G for another einsum, can
+      make the split cost more steps), and only if no strict descendant
+      has its own tiling of dim to adjust (its loop count need not divide
+      by k).  So for G > 1 the bound only removes those values of s, and
+      only at nodes without strict descendants; for dims in other groups
+      it is not applied at all.
+    """
+    model = sm.model
+    ops = sm.all_operands
+
+    # Max useful accelerator granularity per dim; a single dim of a group
+    # could fill the whole axis by itself.
+    G: Dict[str, int] = {}
+    for e in sm.einsums:
+        for d in e.dim_sizes:
+            G.setdefault(d, 1)
+            if e.accel_gran and e.compute_cost > 0:
+                for dims, size in normalize_accel_gran(e):
+                    if d in dims or dims == ('PRODUCT',):
+                        G[d] = max(G[d], size)
+
+    # Dims with G > 1 for which the leaf-node bound is sound (see above)
+    leaf_ok: Dict[str, bool] = {}
+    for d, g in G.items():
+        leaf_ok[d] = g > 1 and all(
+            not (d in dims or dims == ('PRODUCT',)) or (dims == (d,) and size == g)
+            for e in sm.einsums if e.accel_gran and e.compute_cost > 0
+            for dims, size in normalize_accel_gran(e))
+
+    # (e, k) einsum pairs per dim d: d is a reduction dim of e that k, a
+    # consumer of e's output, also has (as in the reduction-loop rule of
+    # _build_factor_constraints)
+    reduction_pairs: Dict[str, List[Tuple[int, int]]] = {}
+    for ei, e in enumerate(sm.einsums):
+        o = e.output_operand
+        for ki, k in enumerate(sm.einsums):
+            if not any(sm.original_names[y] == sm.original_names[o]
+                       for y in k.operand_dims if y != k.output_operand):
+                continue
+            for d in e.dim_sizes:
+                if d not in sm.all_operand_dims[o] and d in k.dim_sizes:
+                    reduction_pairs.setdefault(d, []).append((ei, ki))
+
+    # Literals below may be true only if their condition holds, so setting
+    # them can only switch the bound off.
+    holds: Dict[Tuple[str, int], cp_model.IntVar] = {}
+
+    def holds_einsum(op: str, ei: int) -> cp_model.IntVar:
+        """op's subtree holds an operand of einsum ei."""
+        if (op, ei) not in holds:
+            lit = model.NewBoolVar(f'{op}_subtree_has_einsum_{ei}')
+            model.AddBoolOr([sm.ancestor[op][x]
+                             for x in sm.einsums[ei].operand_dims]).OnlyEnforceIf(lit)
+            holds[(op, ei)] = lit
+        return holds[(op, ei)]
+
+    not_leaf: Dict[str, cp_model.IntVar] = {}
+
+    def has_strict_descendant(op: str) -> cp_model.IntVar:
+        """op's node has a strict descendant."""
+        if op not in not_leaf:
+            strict = []
+            for o in ops:
+                if o == op:
+                    continue
+                lit = model.NewBoolVar(f'{op}_strictly_above_{o}')
+                model.AddImplication(lit, sm.ancestor[op][o])
+                model.AddImplication(lit, sm.ancestor[o][op].Not())
+                strict.append(lit)
+            not_leaf[op] = model.NewBoolVar(f'{op}_has_strict_descendant')
+            model.AddBoolOr(strict).OnlyEnforceIf(not_leaf[op])
+        return not_leaf[op]
+
+    for op in ops:
+        for dim in sm.all_operand_dims[op]:
+            g = G[dim]
+            if g > 1 and not leaf_ok[dim]:
+                continue
+            conds = [sm.ancestor[op][other].Not() for other in ops
+                     if other != op and dim not in sm.all_operand_dims[other]]
+            pairs = reduction_pairs.get(dim, [])
+            if pairs:
+                pair_lits = []
+                for ei, ki in pairs:
+                    lit = model.NewBoolVar(f'{op}_{dim}_holds_{ei}_{ki}')
+                    model.AddImplication(lit, holds_einsum(op, ei))
+                    model.AddImplication(lit, holds_einsum(op, ki))
+                    pair_lits.append(lit)
+                blocked = model.NewBoolVar(f'{op}_{dim}_gran_blocked')
+                model.AddBoolOr(pair_lits).OnlyEnforceIf(blocked)
+                conds.append(blocked.Not())
+            var = sm.spatial_dim[op][dim]
+            if g == 1:
+                model.Add(var <= 1).OnlyEnforceIf(*conds)
+                continue
+            conds.append(has_strict_descendant(op).Not())
+            domain = list(var.proto.domain)  # (the proto field has no negative indexing)
+            allowed = [s for s in range(domain[0], domain[-1] + 1)
+                       if s <= g or s % -(-s // g) != 0]
+            model.AddLinearExpressionInDomain(
+                var, cp_model.Domain.FromValues(allowed)).OnlyEnforceIf(*conds)
 
 
 def _build_optimality_constraints(sm: SchedulerModel,
@@ -1024,9 +1180,26 @@ def _build_optimality_constraints(sm: SchedulerModel,
     - unused_temporal: temporal factors for dimensions that do not appear in
       the current node's operand (and no same-node operand) are forced to 1.
     - spatial_gran: spatial factors for a dimension are bounded by the maximum
-      accelerator granularity for that dimension across all einsums.
-    - same_operand: different occurrences of the same original operand must
-      not be strict ancestors of each other.
+      accelerator granularity for that dimension across all einsums, where
+      that is sound (see _build_spatial_gran).
+    - disjoint_unfused_reads: two occurrences of the same original operand
+      that are both loaded from memory (must_read) have disjoint live
+      ranges, if they have the same dims.  Overlapping ranges imply the two
+      are in the same node or one's range encloses the other's whole
+      window, so the enclosed one, with the rest of its fusion chain
+      (which shares its node and range), could instead be moved into the
+      other's node and joined to its chain, saving its traffic and its
+      buffer (if a moved buffer was the only one of a node with loops,
+      those loops move down to that node's children; this step is argued,
+      not proven).  Only the first occurrence of a fusion chain can be
+      must_read (must_read is 0 exactly when an occurrence has a fusion
+      predecessor), so the rule compares first occurrences of different
+      chains and never two members of one chain, however long.  (Pairs
+      with different dims are exempt: fusing them would forbid loops over
+      the dims they differ in.  A producer and an unfused consumer never
+      overlap anyway, by the correctness rule in _build_fusion, and a fused
+      read aliases the root of its chain, which is covered by this rule or
+      that one.)
     - unfused_separate: operands belonging to different einsums must not be in
       an ancestor relationship when nothing is fused.
     - no_empty_branch: an anchor node with a strict ancestor must have some
@@ -1040,17 +1213,8 @@ def _build_optimality_constraints(sm: SchedulerModel,
     model = sm.model
     ops = sm.all_operands
 
-    # Compute max useful accelerator granularity per dimension
-    max_useful_granularity: Dict[str, int] = {}
-    for e in sm.einsums:
-        for d in e.dim_sizes:
-            if d not in max_useful_granularity:
-                max_useful_granularity[d] = 1
-            if e.accel_gran and e.compute_cost > 0:
-                # A single dim of a group could fill the whole axis by itself.
-                for dims, size in normalize_accel_gran(e):
-                    if d in dims or dims == ('PRODUCT',):
-                        max_useful_granularity[d] = max(max_useful_granularity[d], size)
+    if 'spatial_gran' in enabled:
+        _build_spatial_gran(sm)
 
     for op in ops:
         for dim in sm.op_allowed_temp_dims[op]:
@@ -1063,25 +1227,16 @@ def _build_optimality_constraints(sm: SchedulerModel,
                 ]
                 model.Add(sm.temporal_dim[op][dim] == 1).OnlyEnforceIf(
                     *([sm.same_node[op][other].Not() for other in same_node_users]))
-            # Spatial factor is at most the max useful granularity when all
-            # descendants use this dimension.
-            if 'spatial_gran' in enabled and dim in sm.all_operand_dims[op]:
-                non_users = [
-                    other for other in ops
-                    if dim not in sm.all_operand_dims[other] and other != op
-                ]
-                model.Add(sm.spatial_dim[op][dim] <= max_useful_granularity[dim]).OnlyEnforceIf(
-                    *([sm.ancestor[op][other].Not() for other in non_users]))
 
-    # No strict ancestorship between different occurrences of the
-    # same original operand.
-    for e in sm.einsums if 'same_operand' in enabled else ():
-        for op in e.operand_dims:
-            other_names = [op2 for op2 in ops
-                        if sm.original_names[op2] == sm.original_names[op] and op2 != op]
-            for op2 in other_names:
-                # same_node is allowed; strict ancestorship is not
-                model.Add(sm.ancestor[op][op2] == sm.ancestor[op2][op])
+    # Two loads of the same tensor (with the same dims) are never live at
+    # the same step.
+    reads = list(sm.must_read) if 'disjoint_unfused_reads' in enabled else []
+    for idx, i in enumerate(reads):
+        for j in reads[idx + 1:]:
+            if (sm.original_names[i] == sm.original_names[j]
+                    and sm.all_operand_dims[i] == sm.all_operand_dims[j]):
+                model.AddBoolOr([sm.totally_after[i][j], sm.totally_after[j][i]]).OnlyEnforceIf(
+                    sm.must_read[i], sm.must_read[j])
 
     # When there is no fusion at all, operands from different einsums must not be
     # in any ancestor relationship.
@@ -1510,7 +1665,7 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
     Print the solved schedule to stdout.
 
     If a solution was found (OPTIMAL or FEASIBLE), prints:
-      - Per-operand time intervals, spatial factors, temporal factors, and
+      - Per-operand live step ranges, spatial factors, temporal factors, and
         must_write / must_read flags.
       - A loop-nest representation of the synthesized schedule tree.
 
@@ -1698,17 +1853,17 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
                             None
                         )
                         if fused_producer:
-                            print(f"{inner_indent}{op} = {fused_producer} # Fused alias time {t}")
+                            print(f"{inner_indent}{op} = {fused_producer} # Fused alias, step {t}")
                         else:
-                            print(f"{inner_indent}{op} = zeros({shape_tuple}) # Fused root time {t}")
+                            print(f"{inner_indent}{op} = zeros({shape_tuple}) # Fused root, step {t}")
                     else:
                         if "_read_" in op:
-                            print(f"{inner_indent}{op} = load({orig}, size={shape_tuple}) # time {t}")
+                            print(f"{inner_indent}{op} = load({orig}, size={shape_tuple}) # step {t}")
                         elif op in sm.partial_sum_fills and solver.Value(sm.partial_sum_fills[op]) > 0:
                             print(f"{inner_indent}{op} = zeros({shape_tuple}) if first visit "
-                                  f"else load({orig}, size={shape_tuple}) # partial sums, time {t}")
+                                  f"else load({orig}, size={shape_tuple}) # partial sums, step {t}")
                         else:
-                            print(f"{inner_indent}{op} = zeros({shape_tuple}) # time {t}")
+                            print(f"{inner_indent}{op} = zeros({shape_tuple}) # step {t}")
 
                 elif ev_type == 'compute':
                     idx, write_op, in_ops = item
@@ -1717,7 +1872,7 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
                         f" [{sm.einsums[idx].operation}]"
                         if sm.einsums[idx].operation else ""
                     )
-                    print(f"{inner_indent}{write_op} += compute_einsum_{idx}{op_type_str}({operands_str}) # time {t}")
+                    print(f"{inner_indent}{write_op} += compute_einsum_{idx}{op_type_str}({operands_str}) # step {t}")
 
                 elif ev_type == 'free':
                     op = item
@@ -1731,7 +1886,7 @@ def print_schedule(sm: SchedulerModel, solver: cp_model.CpSolver, status: int) -
                     if is_write:
                         print(f"{inner_indent}store({orig}) = {op}")
                     if not has_fused_consumer:
-                        print(f"{inner_indent}free({op}) # time {t}")
+                        print(f"{inner_indent}free({op}) # step {t}")
 
                 elif ev_type == 'child':
                     print_tree(item, child_indent, new_dim_counts)
