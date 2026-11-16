@@ -8,7 +8,14 @@ The first writes results/<case>/dag.{json,txt} with a fixed time limit
 (default 600 s); the second writes results/<case>/dag_capped.{json,txt} with
 the time limit set to FFM's time on the case (needs results/<case>/ffm.json,
 so run on the same machine with the same --threads as ffm.py). Existing
-results are kept unless --force. Needs results/<case>/einsums.json
+results are kept unless --force.
+
+The capped run is optional: summarize.py derives the capped numbers from the
+fixed-limit run's traces instead (trace: every improving solution;
+bound_trace: every improvement of CP-SAT's bound; see common.at_time). They
+agree with a capped run up to CP-SAT's run-to-run variation, as long as the
+hint tilings (hint_s) fit in the capped run's tilings budget, a tenth of
+FFM's time. Needs results/<case>/einsums.json
 (export.py) but not AccelForge.
 
 The time limit covers the whole run: building the model, the single-einsum
@@ -38,11 +45,16 @@ SETTINGS = dict(num_cores=1, allow_spilling=True, perfect_factorization=True,
 
 class Trace(cp_model.CpSolverSolutionCallback):
     '''(seconds since the run started, traffic, compute cost, objective) of
-    each improving solution. With compute_cost = 0 everywhere the objective is
-    6 x traffic.'''
+    each improving solution, and (seconds, objective bound) of each
+    improvement of CP-SAT's lower bound (bounds). With compute_cost = 0
+    everywhere the objective is 6 x traffic.'''
     def __init__(self, t0):
         super().__init__()
-        self.t0, self.solutions, self.costs = t0, [], None
+        self.t0, self.solutions, self.bounds, self.costs = t0, [], [], None
+
+    def on_bound(self, bound):
+        '''CpSolver.best_bound_callback.'''
+        self.bounds.append((time.perf_counter() - self.t0, bound))
 
     def watch(self, model):
         '''Read the scheduler's traffic and compute cost variables of model.'''
@@ -114,21 +126,26 @@ def extract(sm, solver):
 @contextlib.contextmanager
 def deadline_solve(deadline, trace, timing):
     '''Make the scheduler's CP-SAT solve stop at the deadline (counting the
-    model build) and record improving solutions. The CP-SAT solves that
-    build the hint (each einsum's tiling, and with hint_bound the hint's
-    completion) have their own limits and are left alone.'''
+    model build) and record improving solutions and bounds. The CP-SAT solves
+    that build the hint (each einsum's tiling, and with hint_bound the
+    hint's completion) have their own limits and are left alone; their
+    total time goes to timing['hint_s'].'''
     helpers = ('_tile_einsum', '_solve_einsum_alone', '_complete_hint')
     orig_solve = cp_model.CpSolver.Solve
     orig = {h: getattr(gds, h) for h in helpers}
     tiling = []
+    timing['hint_s'] = 0.0
 
     def inner(f):
         def wrapped(*args, **kwargs):
             tiling.append(True)
+            start = time.perf_counter()
             try:
                 return f(*args, **kwargs)
             finally:
                 tiling.pop()
+                if not tiling:  # outermost helper: count nested ones once
+                    timing['hint_s'] += time.perf_counter() - start
         return wrapped
 
     def solve(solver, model, cb=None):
@@ -137,6 +154,7 @@ def deadline_solve(deadline, trace, timing):
         timing['build_s'] = time.perf_counter() - trace.t0
         trace.watch(model)
         solver.parameters.max_time_in_seconds = max(deadline - time.perf_counter(), 1e-3)
+        solver.best_bound_callback = trace.on_bound
         return orig_solve(solver, model, trace)
 
     cp_model.CpSolver.Solve = solve
@@ -184,7 +202,8 @@ def run(name, time_limit, threads, hint, capped, num_cores=1, stem=None, compare
     wall = time.perf_counter() - t0
     status = solver.StatusName(solver.response_proto.status)
     r = {'case': name, 'tool': 'dag', 'capped_at_ffm': capped, 'status': status,
-         'wall_s': wall, 'build_s': timing.get('build_s'), 'time_limit_s': time_limit,
+         'wall_s': wall, 'build_s': timing.get('build_s'), 'hint_s': timing.get('hint_s'),
+         'time_limit_s': time_limit,
          'seed': seed, 'hint': hint, 'hint_bound': hint_bound, 'hint_given': len(sm.model.proto.solution_hint.vars) > 0,
          'capacity': workload['capacity'], 'bits_per_value': workload.get('bits_per_value'),
          'ffm_traffic': ffm and ffm['traffic'],
@@ -214,6 +233,7 @@ def run(name, time_limit, threads, hint, capped, num_cores=1, stem=None, compare
             r['t_le_ffm_s'] = next((s[0] for s in trace.solutions if s[1] <= ffm['traffic']),
                                    None)
         r['trace'] = trace.solutions
+        r['bound_trace'] = trace.bounds
     save(result_path(name, stem + '.json'), r)
     result_path(name, stem + '.txt').write_text(
         f'# {name} ({stem}): wall {wall:.2f} s of {time_limit:.2f}, status {status}\n'

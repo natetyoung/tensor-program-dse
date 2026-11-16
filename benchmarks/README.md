@@ -9,10 +9,10 @@ The multi-einsum comparison:
 - **Hardware:** a single-level memory hierarchy with one fixed on-chip capacity per case.
 - **Goal of both tools:** minimize off-chip traffic.
 
-Each case is run three ways:
+Each case is run two ways, and reported three ways:
 1. **FFM** at its default optimization level (O3).
 2. **DAG, fixed limit:** the DAG scheduler with a fixed time limit (default 600 s), which shows the traffic it can reach.
-3. **DAG, capped:** the DAG scheduler limited to the time FFM took on the case, which shows the traffic each tool reaches in the same time on the same machine.
+3. **DAG, capped:** the DAG scheduler as of the time FFM took on the case, which shows the traffic each tool reaches in the same time on the same machine. This comes from the fixed-limit run, with no extra run (see [Capped numbers](#capped-numbers)).
 
 ## Setup
 You need Python 3.10 or newer and a checkout of `tensor-program-dse`; this folder is part of it.
@@ -37,14 +37,14 @@ python run.py chain2_tiny siso_c4k         # some cases (about a minute)
 python run.py                              # every case (about 1.75 h on 16 cores)
 ```
 
-`run.py` writes `results/summary.md` at the end and prints it. For each case it runs four steps, each in its own process, so a failure in one step doesn't stop the rest:
+`run.py` writes `results/summary.md` at the end and prints it. For each case it runs three steps, plus an optional fourth, each in its own process, so a failure in one step doesn't stop the rest:
 
 | Step | Command it runs | Writes |
 |---|---|---|
 | export | `export.py CASE` | `results/<case>/einsums.json`: the einsums as AccelForge parses the workload; the DAG scheduler's input |
 | ffm | `ffm.py CASE` | `results/<case>/ffm.json`, `ffm.txt` (mapping) |
 | dag | `dag.py --time-limit S CASE` | `results/<case>/dag.json`, `dag.txt` (schedule) |
-| capped | `dag.py --cap-at-ffm CASE` | `results/<case>/dag_capped.json`, `dag_capped.txt` |
+| capped (optional: `--steps export,ffm,dag,capped`) | `dag.py --cap-at-ffm CASE` | `results/<case>/dag_capped.json`, `dag_capped.txt` |
 
 Each tool can also be run on its own. `summarize.py` rebuilds the summary from whatever results exist.
 
@@ -54,14 +54,14 @@ Each tool can also be run on its own. `summarize.py` rebuilds the summary from w
 |---|---|
 | `--threads N` | FFM worker processes and CP-SAT workers. Default: every core this process may use. Both tools get the same number, so the capped comparison is like-for-like. |
 | `--dag-time-limit S` | Seconds for the fixed-limit DAG run (default 600). |
-| `--steps ffm,dag` | Run only some steps. |
+| `--steps ffm,dag` | Run only some steps. The default is `export,ffm,dag`; add `capped` to also measure the capped run. |
 | `--force` | Rerun steps whose results already exist. By default they are skipped, so an interrupted run can be resumed. |
 | `--no-hint` | Don't hint CP-SAT with single-einsum tilings (see below). |
 | `--hint-bound` | Never return a schedule worse than the hint (`scheduler(hint_bound=True)`; see below). Off by default. |
 | `--measure-memory` | Record each step's peak memory (see [Measuring memory](#measuring-memory)). |
 
 ### Different machines
-- **Times depend on the machine.** The capped run takes its limit from the `ffm.json` produced on the same machine. Always run `ffm` and `capped` together, with the same `--threads`. `dag.py` warns if the thread counts differ.
+- **Times depend on the machine.** The capped numbers compare the DAG run against FFM's time, so run `ffm` and `dag` (and `capped`, if used) on the same machine with the same `--threads`. `summary.md` notes cases whose thread counts differ, and `dag.py --cap-at-ffm` warns about them.
 - **Every result records its machine:** threads, cores, memory, and the versions of Python, ortools, AccelForge and this repository. `summary.md` lists them.
 - **Mixed results:** if a results folder mixes machines or settings, `summary.md` says so; compare times only within one machine.
 - **Memory:** FFM's memory use grows with its number of worker processes. `kda_batched` is by far the largest case. If FFM is killed there, for example by the out-of-memory killer, rerun that case with fewer `--threads`, and use the same number for its DAG runs.
@@ -106,6 +106,20 @@ With `--measure-memory`, `run.py` and `einsum_run.py` run each tool step in its 
   - CP-SAT may overrun the limit slightly. `traffic_at_limit` is the best traffic found within it, and the summary reports that.
 - **Units:** traffic is in elements read plus written off-chip (FFM's bits ÷ `bits_per_value`).
 - **Sanity check:** `invalid_reduction_loops` in the DAG results must be empty. It lists any loop that would make a consumer read a partial sum; the summary flags any it finds.
+
+### Capped numbers
+The capped columns of `summary.md` show the fixed-limit DAG run as it was at FFM's time, taken from the traces that run records (`common.at_time`):
+- `trace`: every improving solution, as (seconds, traffic, compute, objective).
+- `bound_trace`: every improvement of CP-SAT's lower bound, as (seconds, objective bound).
+
+Both count time from the start of the run, as a capped run's limit does, so a run capped at time T would have reached the same point by T. The two can still differ:
+- **CP-SAT's run-to-run variation.** Multi-worker search is nondeterministic, so two runs with the same limit can differ too. That shows most where FFM's time falls in the middle of CP-SAT's improvements (on the existing results, `chain4` and the `siso_c*` cases, in both directions).
+- **Hint tilings.** A capped run gives the hint tilings a tenth of its limit; the fixed-limit run gives them a tenth of 600 s. `summary.md` notes any case whose tilings (`hint_s`) took longer than a capped run would have allowed. Its derived numbers may then be optimistic.
+- **`--hint-bound`:** the hint's completion also gets less time in a capped run, which `summary.md` notes.
+- **Peak memory** of a capped run can't be derived. The fixed-limit run's peak is an upper bound on it.
+- **Older results:** results from before `bound_trace` was added show no bound in the capped status, and can't be checked for the hint-tiling issue.
+
+To check the derived numbers, add the `capped` step. It runs `dag.py --cap-at-ffm` and `summary.md` shows its numbers next to the derived ones as `measured capped`.
 
 ## Core counts, with compute costs
 `python cores.py` runs the DAG scheduler alone, with no FFM, on `swiglu`, `kda_batched`, `gdn_decode`, `siso_k128`, `gqa_llama3_8b` and `kimi_k3_mla`.

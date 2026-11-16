@@ -6,10 +6,15 @@ Usage:
     python run.py --list
 
 For each case, in order: export its einsums (export.py), run FFM (ffm.py),
-run the DAG scheduler with a fixed time limit (dag.py), and run it again
-capped at FFM's time (dag.py --cap-at-ffm). Each step runs in its own
-process, so one failing (e.g. FFM running out of memory) does not stop the
-others. Steps whose results exist are skipped unless --force.
+and run the DAG scheduler with a fixed time limit (dag.py). The summary's
+capped columns (the DAG scheduler as of FFM's time) come from the fixed-limit
+run's traces. Each step runs in its own process, so one failing (e.g. FFM
+running out of memory) does not stop the others. Steps whose results exist
+are skipped unless --force.
+
+The optional step capped (--steps export,ffm,dag,capped) also runs the DAG
+scheduler again, actually capped at FFM's time (dag.py --cap-at-ffm), as a
+check on the derived numbers; the summary then shows both.
 
 FFM and CP-SAT get the same number of threads (--threads, default: every
 available core), so the capped comparison gives both the same machine for
@@ -25,6 +30,7 @@ from cases import CASES
 import summarize
 
 STEPS = ['export', 'ffm', 'dag', 'capped']
+DEFAULT_STEPS = ['export', 'ffm', 'dag']
 
 
 def main():
@@ -33,8 +39,9 @@ def main():
                                 epilog='\n\n'.join(__doc__.split('\n\n')[1:]))
     p.add_argument('cases', nargs='*', metavar='CASE', help='cases to run (default: all)')
     p.add_argument('--list', action='store_true', help='list the cases and exit')
-    p.add_argument('--steps', default=','.join(STEPS),
-                   help=f'comma-separated subset of {",".join(STEPS)} (default: all)')
+    p.add_argument('--steps', default=','.join(DEFAULT_STEPS),
+                   help=f'comma-separated subset of {",".join(STEPS)} '
+                        f'(default: {",".join(DEFAULT_STEPS)})')
     p.add_argument('--threads', type=int, default=available_cores(),
                    help='FFM processes and CP-SAT workers (default: all available cores, '
                         f'{available_cores()} here). Fewer FFM processes use less memory.')

@@ -4,7 +4,9 @@ Results go to results/<case>/ next to this file:
     einsums.json      the case's einsums as AccelForge parses them (export.py)
     ffm.json/.txt     FFM's result and mapping (ffm.py)
     dag.json/.txt     the DAG scheduler with a fixed time limit (dag.py)
-    dag_capped.json   the DAG scheduler capped at FFM's time (dag.py --cap-at-ffm)
+    dag_capped.json   optional: the DAG scheduler capped at FFM's time (dag.py
+                      --cap-at-ffm); summarize.py derives the same from dag.json
+                      (at_time)
     tcm.json/.txt     single einsums: TCM's result and mapping (einsum_tcm.py)
     cpsat.json/.txt   single einsums: cb_einsum_ml's, evaluated by AccelForge
                       (einsum_cpsat.py)
@@ -151,3 +153,38 @@ def machine_info(threads):
             'memory_gb': total_memory_gb(), 'platform': platform.platform(),
             'python': platform.python_version(), 'ortools': _package('ortools'),
             'accelforge': _package('accelforge'), 'tensor_program_dse': _repo_commit()}
+
+
+def at_time(r, t):
+    '''What DAG run r (a dag.py result) had reached t seconds into the run,
+    from its traces, as if it had been given a time limit of t: a dict of
+    traffic        best traffic found by t (None: no solution yet)
+    objective      its objective (None in older results, whose trace
+                   entries are only (seconds, traffic))
+    bound          CP-SAT's best traffic bound by t (None: not recorded,
+                   which results from before bound_trace always are, or
+                   compute costs make the objective more than traffic)
+    proved         optimality was proved by t
+    proved_later   not proved by t, but the run later proved this traffic
+                   optimal
+    or None if unknown: t is past r's time limit and r did not prove
+    optimality, or r found no solution at all.'''
+    trace = r.get('trace')
+    optimal = r.get('status') == 'OPTIMAL'
+    if not trace or (t > r['time_limit_s'] and not optimal):
+        return None
+    found = [s for s in trace if s[0] <= t]
+    if not found:
+        return {'traffic': None, 'objective': None, 'bound': None, 'proved': False,
+                'proved_later': False}
+    traffic = found[-1][1]
+    objective = found[-1][3] if len(found[-1]) > 3 else None
+    bounds = [b for s, b in r.get('bound_trace') or [] if s <= t]
+    proved = ((optimal and r['wall_s'] <= t)
+              or bool(bounds and objective is not None and max(bounds) >= objective))
+    scale = None if any(r.get('compute_costs') or ()) else 6  # objective = 6 x traffic
+    bound = max(bounds) / scale if bounds and scale else None
+    if proved:
+        bound = traffic
+    return {'traffic': traffic, 'objective': objective, 'bound': bound, 'proved': proved,
+            'proved_later': optimal and not proved and found[-1][1:] == trace[-1][1:]}
